@@ -1,0 +1,666 @@
+---
+title: "¿Se asocia una oferta alimentaria más diversa con más energía, grasa y calidad? Análisis diagnóstico de panel en Sudamérica (FAO, 2010-2023) y pronóstico breve de la energía"
+author: "Juan Salazar y Luz Ríos"
+date: "`r paste(format(Sys.Date(), '%d'), 'de', c('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')[as.integer(format(Sys.Date(), '%m'))], 'de', format(Sys.Date(), '%Y'))`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5,
+                      out.width = "90%")
+
+library(tidyverse)
+library(janitor)
+library(plm)
+library(sandwich)
+library(lmtest)
+library(knitr)
+
+set.seed(123)
+theme_set(theme_minimal(base_size = 12))
+
+paleta_paises <- c(Argentina = "#1B9E77", Bolivia = "#D95F02", Brasil = "#7570B3",
+                   Chile = "#E7298A", Colombia = "#66A61E", Ecuador = "#E6AB02",
+                   Paraguay = "#A6761D", Perú = "#666666", Uruguay = "#1F78B4",
+                   Venezuela = "#E31A1C")
+
+# Formateadores para el texto dinámico (inline): todo número de la prosa sale de los datos
+f2  <- function(x, d = 2) formatC(x, format = "f", digits = d)
+fm  <- function(x, d = 0) formatC(x, format = "f", digits = d, big.mark = " ")
+fp  <- function(p) ifelse(p < 0.001, "< 0.001", paste0("= ", formatC(p, format = "f", digits = 3)))
+fpt <- function(p) ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+fs  <- function(x, d = 1) sprintf(paste0("%+.", d, "f"), x)
+fuente <- "Fuente: FAOSTAT, cálculos propios"
+```
+
+```{r logo, echo=FALSE, results='asis'}
+ruta_logo <- file.path("assets", "LOGO_ITM_2020-04.png")  # opcional: el logo no se publica
+if (file.exists(ruta_logo)) {
+  cat('<div style="text-align:right;"><img src="', knitr::image_uri(ruta_logo),
+      '" style="width:150px;"></div>', sep = "")
+}
+```
+
+```{r carga}
+ruta <- file.path("data", "processed")  # relativo a la raíz del repo (ver scripts/render.R)
+panel <- read_csv(file.path(ruta, "panel_pais_anio_definitivo.csv"), show_col_types = FALSE) |>
+  clean_names() |>
+  arrange(pais, ano)
+kpis  <- read_csv(file.path(ruta, "paises_definitivo_kpis.csv"), show_col_types = FALSE) |> clean_names()
+
+anios   <- sort(unique(panel$ano))
+paises  <- sort(unique(panel$pais))
+G       <- length(paises)          # número de países = número de grupos (clústeres)
+T_      <- length(anios)           # años por país
+equilibrado <- nrow(panel) == G * T_ && all(count(panel, pais)$n == T_)
+
+# Diversidad estandarizada (misma definición que en el informe descriptivo v3):
+# food_diversity_index = Shannon (ln) sobre los 13 grupos; se estandariza con la DE de las 140 observaciones.
+sd_div_pool   <- sd(panel$food_diversity_index)
+sd_div_within <- sd(panel$food_diversity_index - ave(panel$food_diversity_index, panel$pais))
+sd_div_between <- sd(tapply(panel$food_diversity_index, panel$pais, mean))
+panel <- panel |>
+  mutate(div_z = (food_diversity_index - mean(food_diversity_index)) / sd_div_pool,
+         t_c = ano - min(ano))
+
+resultados <- c("kcal_dia_total", "grasa_g_dia_total", "indice_calidad_oferta")
+et_res     <- c("Energía", "Grasa", "Índice de calidad")
+unid       <- c("kcal/día", "g/día", "puntos")
+names(et_res) <- names(unid) <- resultados
+media_y <- map_dbl(resultados, ~ mean(panel[[.x]])); names(media_y) <- resultados
+
+pp <- pdata.frame(as.data.frame(panel), index = c("pais", "ano"))
+```
+
+# Introducción y especificación
+
+## Pregunta e hipótesis
+
+El informe descriptivo previo (v3) describió la oferta alimentaria de `r G` países de Sudamérica entre `r min(anios)` y `r max(anios)` y recomendó que la siguiente etapa fuera **diagnóstica**: pasar de describir a contrastar relaciones con un modelo de panel y una inferencia adecuada para pocos grupos. Esta es esa etapa. La pregunta es:
+
+> **Dentro de cada país y a lo largo de `r min(anios)`-`r max(anios)`, ¿los años en que la oferta alimentaria es más diversa son también años con más energía, más grasa y mejor calidad de la oferta?**
+
+Hipótesis (todas **asociacionales**; ninguna pretende establecer causalidad):
+
+- **H1.** Mayor diversidad se asocia con más energía disponible (kcal por persona y día).
+- **H2.** Mayor diversidad se asocia con más grasa disponible (g por persona y día).
+- **H3.** Mayor diversidad se asocia con un mayor índice de calidad de la oferta (`indice_calidad_oferta`, parcial: considera solo frutas y hortalizas y energía de grasa).
+
+La **proteína no está en el panel** (solo existe en los indicadores por país de la ventana 2019-2023), así que no puede estudiarse dentro de cada país a lo largo del tiempo; el informe v3 la trató solo entre países y aquí queda fuera del modelo.
+
+Estos resultados describen **asociaciones**, no efectos causales: con datos observacionales agregados no se puede descartar que otras variables (ingreso, precios, clima, políticas) muevan a la vez la diversidad y los nutrientes, ni que la relación sea en parte mecánica (el índice de diversidad se calcula con la misma oferta que determina la energía y la grasa).
+
+## Por qué la variación *dentro* de cada país
+
+En el panel (`r nrow(panel)` filas = `r G` países x `r T_` años`r if (!equilibrado) " (no equilibrado)" else ", equilibrado"`), las diferencias **entre** países (clima, cultura alimentaria, tamaño y estructura productiva) son grandes y permanentes y mezclan muchas causas. El informe v3 ya mostró que, entre países, ninguna asociación de la diversidad resiste la corrección por pruebas múltiples. Lo informativo es comparar cada país **consigo mismo** en distintos años: los *efectos fijos de país* eliminan todo lo que no cambia en el tiempo dentro de cada país, aunque no se haya medido. La contrapartida es que la variación que queda es pequeña: la desviación estándar de la diversidad es `r f2(sd_div_pool, 3)` en el panel completo, `r f2(sd_div_between, 3)` entre promedios de país y solo `r f2(sd_div_within, 3)` dentro de los países.
+
+## Especificación
+
+Para el país $i$ y el año $t$, con resultado $y_{it}$ (energía, grasa o calidad):
+
+$$
+y_{it} = \alpha_i + \beta \, \text{Div}_{it} + \gamma \, t + \varepsilon_{it}
+$$
+
+donde $\text{Div}_{it}$ es el índice de Shannon estandarizado, $\alpha_i$ es el efecto fijo del país y $t$ es una tendencia lineal común. La variante *bidireccional* (two-way) reemplaza $\gamma t$ por efectos de año $\lambda_t$: $y_{it} = \alpha_i + \lambda_t + \beta \,\text{Div}_{it} + \varepsilon_{it}$.
+
+- **Diversidad estandarizada.** $\text{Div}_{it}$ = (índice - media) / DE, con la **DE del panel completo** (`r f2(sd_div_pool, 3)`, no la intra-país). Por eso $\beta$ se lee como "cambio en el resultado por cada **+1 DE de diversidad del panel**", unidad comparable con el informe v3. Como la DE intra-país es `r f2(sd_div_within / sd_div_pool, 2)` veces la del panel, un movimiento de +1 DE del panel es más grande que lo que típicamente cambia un país a lo largo del tiempo; el coeficiente por unidad de DE intra-país se obtiene multiplicando por ese factor.
+- **Controles.** Se incluyen **efectos fijos de país** y una **tendencia común** (o efectos de año en la variante bidireccional): la energía, la diversidad y la dependencia de importaciones suben con el tiempo en la región (informe v3), y sin control temporal la regresión captaría esa tendencia compartida. **No** se añaden controles de comercio exterior en el modelo principal, porque la dependencia de importaciones o la autosuficiencia pueden ser *mediadores* (la apertura comercial puede ampliar la variedad, y esa variedad influir en los nutrientes): controlar por ellos eliminaría parte del canal que se quiere medir (*mala práctica de "control malo"*). Se prueba como análisis de sensibilidad en la sección de robustez, con esa advertencia.
+- **Variables excluidas.** No se usa la columna `cluster` del panel (informe v3: no tiene una definición consistente).
+- **Efecto como % de la media.** Además del coeficiente en unidades, se reporta el efecto dividido por la media del resultado en el panel (`r paste0(et_res, " ", fm(media_y, 1), " ", unid, collapse = "; ")`), para comparar la magnitud entre resultados.
+
+# Modelos principales
+
+```{r modelos}
+ajustar <- function(y, datos = pp) {
+  f1 <- as.formula(paste(y, "~ div_z + t_c"))
+  f2_ <- as.formula(paste(y, "~ div_z"))
+  list(pooled = plm(f1, datos, model = "pooling"),
+       fe     = plm(f1, datos, model = "within"),
+       re     = plm(f1, datos, model = "random"),
+       fe2    = plm(f2_, datos, model = "within", effect = "twoways"))
+}
+mods <- map(set_names(resultados), ajustar)
+
+vc_cl <- function(m) vcovHC(m, method = "arellano", type = "HC1", cluster = "group")
+lag_dk <- 2
+vc_dk <- function(m) vcovSCC(m, type = "HC1", maxlag = lag_dk)
+gl_t  <- G - 1   # grados de libertad t con G clústeres (criterio conservador)
+
+et_mod <- c(pooled = "MCO agrupado (pooled)", fe = "Efectos fijos de país + tendencia",
+            re = "Efectos aleatorios + tendencia", fe2 = "Efectos fijos de país y de año")
+
+tab_mod <- map_dfr(resultados, function(y) {
+  imap_dfr(mods[[y]], function(m, nm) {
+    vc <- vc_cl(m); b <- unname(coef(m)["div_z"]); se <- sqrt(vc["div_z", "div_z"])
+    tibble(resultado = et_res[y], modelo = et_mod[nm], coef = b, pct_media = 100 * b / media_y[y],
+           ee_agrupado = se, p_agrupado = 2 * pt(-abs(b / se), gl_t))
+  })
+})
+tab_mod |> mutate(p_agrupado = fpt(p_agrupado)) |>
+  kable(digits = c(0, 0, 2, 2, 2, 0), col.names = c("Resultado", "Modelo", "Coef. por +1 DE", "% de la media", "EE (agrupado por país)", "p (t con G-1 gl)"),
+        caption = "Asociación de +1 DE de diversidad con cada resultado, según el modelo (errores agrupados por país)")
+```
+
+Lectura: el modelo **agrupado** y el de **efectos aleatorios** mezclan comparaciones entre países y dentro de cada país; el de **efectos fijos** usa solo la variación dentro de cada país; el **bidireccional** además elimina cualquier shock común a todos los países en un mismo año (por ejemplo, un cambio metodológico de la FAO o un shock regional de precios).
+
+```{r mod-txt, include=FALSE}
+cf <- function(y, nm) tab_mod$coef[tab_mod$resultado == et_res[y] & tab_mod$modelo == et_mod[nm]]
+pg <- function(y, nm) tab_mod$p_agrupado[tab_mod$resultado == et_res[y] & tab_mod$modelo == et_mod[nm]]
+dif_pool_fe <- map_chr(resultados, function(y) {
+  a <- cf(y, "pooled"); b <- cf(y, "fe")
+  if (sign(a) != sign(b)) "cambia de signo" else if (abs(a) > 1.5 * abs(b)) "es mayor en valor absoluto" else if (abs(a) < abs(b) / 1.5) "es menor en valor absoluto" else "es de magnitud similar"
+})
+names(dif_pool_fe) <- resultados
+```
+
+Al pasar del modelo agrupado al de efectos fijos, el coeficiente de la **energía** `r dif_pool_fe["kcal_dia_total"]` (`r fs(cf("kcal_dia_total", "pooled"), 1)` frente a `r fs(cf("kcal_dia_total", "fe"), 1)` kcal/día), el de la **grasa** `r dif_pool_fe["grasa_g_dia_total"]` (`r fs(cf("grasa_g_dia_total", "pooled"), 1)` frente a `r fs(cf("grasa_g_dia_total", "fe"), 1)` g/día) y el de la **calidad** `r dif_pool_fe["indice_calidad_oferta"]` (`r fs(cf("indice_calidad_oferta", "pooled"), 1)` frente a `r fs(cf("indice_calidad_oferta", "fe"), 1)` puntos). Es decir, `r if (any(grepl("cambia|mayor|menor", dif_pool_fe))) "las diferencias permanentes entre países influyen en la asociación agrupada: no conviene interpretarla como lo que ocurre cuando un país se diversifica." else "la asociación dentro de cada país se parece a la agrupada."`
+
+```{r fig-within, fig.height=4.8}
+panel |>
+  mutate(div_dm = div_z - ave(div_z, pais),
+         kcal_dm = kcal_dia_total - ave(kcal_dia_total, pais)) |>
+  ggplot(aes(div_dm, kcal_dm, color = pais)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
+  scale_color_manual(values = paleta_paises) +
+  labs(title = "Dentro de cada país: diversidad y energía (desviaciones respecto del promedio del país)",
+       subtitle = "Cada punto es un país-año; la recta negra es el ajuste lineal de las 140 desviaciones",
+       x = "Diversidad (DE del panel) respecto del promedio del país",
+       y = "Energía (kcal/día) respecto del promedio del país", color = NULL, caption = fuente)
+```
+
+## Efectos fijos o aleatorios: prueba de Hausman
+
+La prueba de Hausman contrasta si el estimador de efectos aleatorios (más eficiente) coincide con el de efectos fijos (más robusto). Si **se rechaza**, los efectos de país están correlacionados con la diversidad y los efectos aleatorios serían inconsistentes: se prefieren los fijos. Se reportan la versión clásica y una versión robusta (variante de Mundlak: regresión con el promedio por país de la diversidad y errores agrupados), porque la clásica supone errores homocedásticos e independientes.
+
+```{r hausman}
+haus <- map_dfr(resultados, function(y) {
+  h1 <- tryCatch(phtest(mods[[y]]$fe, mods[[y]]$re), error = function(e) NULL)
+  # Versión robusta (Mundlak): se añade el promedio por país de la diversidad; H0: su coeficiente es 0
+  # (equivalente al contraste de Hausman para el regresor que varía en el tiempo), con errores agrupados por país
+  dd <- panel |> mutate(div_bar = ave(div_z, pais))
+  h2 <- tryCatch({
+    mm <- lm(as.formula(paste(y, "~ div_z + t_c + div_bar")), data = dd)
+    ct <- coeftest(mm, vcov. = vcovCL(mm, cluster = dd$pais, type = "HC1"))
+    2 * pt(-abs(ct["div_bar", "Estimate"] / ct["div_bar", "Std. Error"]), gl_t)
+  }, error = function(e) NA_real_)
+  tibble(resultado = et_res[y],
+         chi2 = if (!is.null(h1)) unname(h1$statistic) else NA_real_,
+         gl = if (!is.null(h1)) unname(h1$parameter) else NA_real_,
+         p_clasico = if (!is.null(h1)) h1$p.value else NA_real_,
+         p_robusto = h2)
+})
+haus <- haus |> mutate(decision = case_when(is.na(p_clasico) ~ "No disponible",
+                                           p_clasico < 0.05 ~ "Se rechaza RE: usar efectos fijos",
+                                           TRUE ~ "No se rechaza RE"))
+haus |> mutate(across(starts_with("p_"), fpt)) |>
+  kable(digits = 2, col.names = c("Resultado", "Chi-cuadrado", "gl", "p (clásico)", "p (robusto)", "Decisión (clásico, 5 %)"),
+        caption = "Prueba de Hausman: efectos fijos frente a aleatorios")
+```
+
+```{r haus-txt, include=FALSE}
+n_haus_rech <- sum(haus$p_clasico < 0.05, na.rm = TRUE)
+frase_haus <- function(i) paste0("**", haus$resultado[i], "**: chi-cuadrado = ", f2(haus$chi2[i], 2), " (", haus$gl[i], " gl), p ", fp(haus$p_clasico[i]),
+                                 " (versión robusta: p ", fp(haus$p_robusto[i]), "); ",
+                                 ifelse(haus$p_clasico[i] < 0.05, "se rechaza que los efectos de país sean independientes de la diversidad.", "no hay evidencia suficiente contra los efectos aleatorios."))
+```
+
+Resultado de la prueba: `r paste(map_chr(seq_len(nrow(haus)), frase_haus), collapse = " ")` `r if (any(haus$p_robusto < 0.10 & haus$p_clasico >= 0.05, na.rm = TRUE)) paste0("La versión robusta se acerca al rechazo en ", paste(tolower(haus$resultado[haus$p_robusto < 0.10 & haus$p_clasico >= 0.05]), collapse = " y "), " (p < 0.10), lo que sugiere cierta correlación entre los efectos de país y la diversidad que la prueba clásica no detecta. ") else ""``r if (n_haus_rech == nrow(haus)) "En los tres casos se prefiere el modelo de efectos fijos, como ya sugería la estructura de los datos." else if (n_haus_rech == 0) "En ningún caso se rechaza la igualdad; aun así, con solo diez países la prueba tiene poca potencia, y se mantienen los efectos fijos como modelo principal por ser la comparación intra-país más prudente." else "El resultado es mixto: se rechazan los efectos aleatorios en algunos resultados y no en otros; se mantienen los efectos fijos como modelo principal por ser la lectura intra-país más prudente y consistente entre resultados."`
+
+# Inferencia con pocos grupos
+
+Con solo `r G` países, los errores estándar "de manual" y aun los agrupados por país pueden ser demasiado optimistas (la teoría de los errores agrupados exige muchos grupos). Por eso el coeficiente principal se evalúa con cinco enfoques:
+
+1. **Clásico**: supone errores independientes y homocedásticos (se muestra solo como referencia).
+2. **Agrupado por país** (Arellano, HC1): permite correlación arbitraria dentro de cada país a lo largo del tiempo; p con distribución $t$ de `r gl_t` grados de libertad ($G-1$).
+3. **Driscoll-Kraay** (rezago `r lag_dk`): además admite correlación entre países en un mismo año, pero requiere muchos años; con $T$ = `r T_` es aproximado.
+4. **Bootstrap salvaje por país con pesos de Webb** (*wild cluster bootstrap*, versión restringida: se impone la hipótesis nula y se remuestrea el residuo multiplicado por un peso aleatorio común a todo el país). Se implementó manualmente (`r format(1999, big.mark = "")` réplicas, semilla fija). Los pesos de Webb toman seis valores, lo que da una distribución mucho más rica que la de dos valores cuando hay pocos grupos. El IC se aproxima como coef. $\pm$ el cuantil 95 % de $|t^*|$ por el error estándar agrupado.
+5. **Bootstrap salvaje con pesos de Rademacher (exacto)**: con $G$ = `r G` países solo existen $2^{G}$ = `r 2^G` combinaciones de signos (la mitad dan el mismo valor absoluto), por lo que no tiene sentido simular: se **enumeran todas**. Se muestra como verificación.
+
+```{r bootstrap}
+webb <- c(-sqrt(1.5), -1, -sqrt(0.5), sqrt(0.5), 1, sqrt(1.5))
+n_boot <- 1999
+
+# Transformación within (equilibrado): desviaciones respecto de país (y de año si dos = TRUE)
+D2 <- function(x, dos) {
+  x <- as.matrix(x)
+  r <- x - apply(x, 2, function(c) ave(c, panel$pais))
+  if (dos) r <- r - apply(x, 2, function(c) ave(c, panel$ano)) + matrix(colMeans(x), nrow(x), ncol(x), byrow = TRUE)
+  r
+}
+
+wcb <- function(y, dos, tipo = c("webb", "rademacher"), B = n_boot, semilla = 20240601) {
+  tipo <- match.arg(tipo)
+  X  <- if (dos) cbind(div_z = panel$div_z) else cbind(div_z = panel$div_z, t_c = panel$t_c)
+  Xd <- D2(X, dos); yd <- D2(y, dos)[, 1]
+  gi <- match(panel$pais, paises); N <- nrow(Xd); K <- ncol(Xd)
+  XtXi <- solve(crossprod(Xd))
+  est <- function(yy) {                      # coeficiente de div_z y EE agrupado (CR1)
+    b <- XtXi %*% crossprod(Xd, yy); e <- as.vector(yy - Xd %*% b)
+    S <- rowsum(Xd * e, gi)
+    V <- XtXi %*% crossprod(S) %*% XtXi * G / (G - 1) * (N - 1) / (N - K)
+    c(b[1], sqrt(V[1, 1]))
+  }
+  o <- est(yd); t0 <- o[1] / o[2]
+  if (dos) fit_r <- rep(0, N) else {          # modelo restringido (sin diversidad)
+    Xr <- Xd[, 2, drop = FALSE]; fit_r <- as.vector(Xr %*% solve(crossprod(Xr), crossprod(Xr, yd)))
+  }
+  u <- yd - fit_r
+  W <- if (tipo == "rademacher") as.matrix(expand.grid(rep(list(c(-1, 1)), G)))
+       else { set.seed(semilla); matrix(sample(webb, B * G, replace = TRUE), B, G) }
+  ts_ <- apply(W, 1, function(w) { ys <- fit_r + D2(w[gi] * u, dos)[, 1]; r <- est(ys); r[1] / r[2] })
+  p <- if (tipo == "rademacher") mean(abs(ts_) >= abs(t0) - 1e-12) else (1 + sum(abs(ts_) >= abs(t0))) / (length(ts_) + 1)
+  q95 <- unname(quantile(abs(ts_), 0.95))
+  list(b = o[1], se = o[2], t = t0, p = p, lo = o[1] - q95 * o[2], hi = o[1] + q95 * o[2], n_sim = length(ts_))
+}
+
+metodos <- c("Clásico (referencia)", "Agrupado por país (HC1)", "Driscoll-Kraay",
+             "Bootstrap salvaje (Webb)", "Bootstrap salvaje (Rademacher, exacto)")
+
+inferencia <- function(dos) {
+  out <- map_dfr(resultados, function(y) {
+    m <- if (dos) mods[[y]]$fe2 else mods[[y]]$fe
+    b <- unname(coef(m)["div_z"])
+    analit <- function(vc) { se <- sqrt(vc["div_z", "div_z"])
+      tibble(coef = b, lo = b - qt(0.975, gl_t) * se, hi = b + qt(0.975, gl_t) * se, p = 2 * pt(-abs(b / se), gl_t)) }
+    bw <- wcb(panel[[y]], dos, "webb"); br <- wcb(panel[[y]], dos, "rademacher")
+    bind_rows(analit(vcov(m)), analit(vc_cl(m)), analit(vc_dk(m)),
+              tibble(coef = bw$b, lo = bw$lo, hi = bw$hi, p = bw$p),
+              tibble(coef = br$b, lo = br$lo, hi = br$hi, p = br$p)) |>
+      mutate(resultado = y, metodo = metodos, .before = 1)
+  })
+  out |> group_by(metodo) |> mutate(p_holm = p.adjust(p, "holm")) |> ungroup() |>
+    mutate(pct_media = 100 * coef / media_y[resultado], sig = p < 0.05, sig_holm = p_holm < 0.05)
+}
+inf_fe  <- inferencia(FALSE)
+inf_fe2 <- inferencia(TRUE)
+```
+
+```{r inf-tabla}
+tab_inf <- function(d, cap) {
+  d |> mutate(resultado = et_res[resultado], p = fpt(p), p_holm = fpt(p_holm)) |>
+    arrange(match(resultado, et_res), match(metodo, metodos)) |>
+    select(resultado, metodo, coef, lo, hi, pct_media, p, p_holm) |>
+    kable(digits = c(0, 0, 2, 2, 2, 2, 0, 0), caption = cap,
+          col.names = c("Resultado", "Método", "Coef. por +1 DE", "IC 95 % inf.", "IC 95 % sup.", "% de la media", "p", "p (Holm, 3 resultados)"))
+}
+tab_inf(inf_fe, "Efectos fijos de país + tendencia: coeficiente, IC y valor p por método de inferencia (Holm aplicado dentro de cada método a los tres resultados)")
+```
+
+```{r inf-fig, fig.height=4.6}
+inf_fe |>
+  mutate(res = factor(et_res[resultado], levels = et_res), metodo = factor(metodo, levels = rev(metodos))) |>
+  ggplot(aes(100 * coef / media_y[resultado], metodo, color = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_pointrange(aes(xmin = 100 * lo / media_y[resultado], xmax = 100 * hi / media_y[resultado])) +
+  scale_color_manual(values = c(`TRUE` = "#1B9E77", `FALSE` = "grey50"), labels = c(`TRUE` = "p < 0.05", `FALSE` = "p >= 0.05"), name = NULL) +
+  facet_wrap(~res, scales = "free_x") +
+  labs(title = "Efecto de +1 DE de diversidad según el método de inferencia",
+       subtitle = "Efectos fijos de país + tendencia; coeficiente e IC 95 % como % de la media del resultado",
+       x = "% de la media del resultado", y = NULL, caption = fuente)
+```
+
+```{r inf-txt, include=FALSE}
+g1 <- function(tab, y, met, col) tab[[col]][tab$resultado == y & tab$metodo == met]
+m_cl <- "Agrupado por país (HC1)"; m_wb <- "Bootstrap salvaje (Webb)"; m_dk <- "Driscoll-Kraay"; m_rd <- "Bootstrap salvaje (Rademacher, exacto)"
+n_sig_wb   <- sum(inf_fe$sig[inf_fe$metodo == m_wb])
+n_holm_wb  <- sum(inf_fe$sig_holm[inf_fe$metodo == m_wb])
+n_sig_cl   <- sum(inf_fe$sig[inf_fe$metodo == m_cl])
+n_sig_dk   <- sum(inf_fe$sig[inf_fe$metodo == m_dk])
+dif_cat <- function(y) {                 # ¿cambia la conclusión (p < 0.05) entre agrupado y bootstrap?
+  g1(inf_fe, y, m_cl, "sig") != g1(inf_fe, y, m_wb, "sig")
+}
+frase_inf <- function(y) {
+  b <- g1(inf_fe, y, m_wb, "coef")
+  paste0("**", et_res[y], "**: ", fs(b, ifelse(y == "indice_calidad_oferta", 2, 1)), " ", unid[y], " por +1 DE (", fs(g1(inf_fe, y, m_wb, "pct_media"), 2), " % de la media); IC 95 % bootstrap [",
+         f2(g1(inf_fe, y, m_wb, "lo"), 2), "; ", f2(g1(inf_fe, y, m_wb, "hi"), 2), "]; p agrupado ", fp(g1(inf_fe, y, m_cl, "p")),
+         ", p Driscoll-Kraay ", fp(g1(inf_fe, y, m_dk, "p")), ", p bootstrap Webb ", fp(g1(inf_fe, y, m_wb, "p")),
+         ", p Holm ", fp(g1(inf_fe, y, m_wb, "p_holm")), ".")
+}
+k_y <- "kcal_dia_total"; g_y <- "grasa_g_dia_total"; q_y <- "indice_calidad_oferta"
+ic_cl_ancho <- mean(g1(inf_fe, k_y, m_wb, "hi") - g1(inf_fe, k_y, m_wb, "lo")) / mean(g1(inf_fe, k_y, m_cl, "hi") - g1(inf_fe, k_y, m_cl, "lo"))
+dif_rad <- max(abs(inf_fe$p[inf_fe$metodo == m_wb] - inf_fe$p[inf_fe$metodo == m_rd]))
+```
+
+**Resultados con efectos fijos de país y tendencia.** `r paste(map_chr(resultados, frase_inf), collapse = " ")`
+
+- Con el bootstrap salvaje (Webb), `r n_sig_wb` de 3 asociaciones son significativas al 5 % y `r n_holm_wb` lo siguen siendo tras Holm; con errores agrupados, `r n_sig_cl`; con Driscoll-Kraay, `r n_sig_dk`.
+- `r if (any(map_lgl(resultados, dif_cat))) paste0("La conclusión **cambia según el método** para: ", paste(et_res[resultados[map_lgl(resultados, dif_cat)]], collapse = ", "), ". Es la señal de fragilidad típica de la inferencia con pocos grupos.") else "El método de inferencia no altera ninguna conclusión de significancia al 5 % entre el agrupado y el bootstrap."`
+- El IC del bootstrap para la energía es `r f2(ic_cl_ancho, 2)` veces el ancho del IC agrupado `r if (ic_cl_ancho > 1) "(más amplio, como se espera de un método que no supone muchos grupos)." else "(no más amplio)."` Los pesos de Rademacher (enumeración exacta de `r 2^G` combinaciones) y los de Webb difieren en p como máximo en `r f2(dif_rad, 3)`.
+
+La variante con **efectos de año** (bidireccional), que además absorbe cualquier shock común a todos los países, da:
+
+```{r inf-fe2}
+tab_inf(inf_fe2, "Efectos fijos de país y de año: coeficiente, IC y valor p por método de inferencia")
+```
+
+```{r inf-fe2-txt, include=FALSE}
+n_sig_wb2 <- sum(inf_fe2$sig[inf_fe2$metodo == m_wb]); n_holm_wb2 <- sum(inf_fe2$sig_holm[inf_fe2$metodo == m_wb])
+```
+
+Con efectos de año, `r n_sig_wb2` de 3 asociaciones son significativas con el bootstrap Webb y `r n_holm_wb2` tras Holm`r if (n_sig_wb2 < n_sig_wb) ": al quitar los shocks comunes por año, la evidencia se debilita, lo que indica que parte de la asociación en el modelo con tendencia provenía de movimientos compartidos por la región." else if (n_sig_wb2 > n_sig_wb) ": absorber los shocks comunes por año refuerza la evidencia." else "."`
+
+# Diagnósticos de los errores
+
+Los supuestos de los errores determinan qué errores estándar son creíbles. Se contrastan en el modelo de efectos fijos: **autocorrelación serial** (Breusch-Godfrey de panel y Wooldridge), **dependencia entre países** en el mismo año (Pesaran CD, con y sin efectos de año) y **heterocedasticidad** (Breusch-Pagan sobre el modelo con dummies de país).
+
+```{r diagnosticos}
+diag_tab <- map_dfr(resultados, function(y) {
+  m <- mods[[y]]$fe; m2 <- mods[[y]]$fe2
+  bg  <- tryCatch(pbgtest(m, order = 1), error = function(e) NULL)
+  wa  <- tryCatch(pwartest(m), error = function(e) NULL)
+  cd  <- tryCatch(pcdtest(m, test = "cd"), error = function(e) NULL)
+  cd2 <- tryCatch(pcdtest(m2, test = "cd"), error = function(e) NULL)
+  bp  <- tryCatch(bptest(lm(as.formula(paste(y, "~ div_z + t_c + factor(pais)")), data = panel)), error = function(e) NULL)
+  g <- function(x, w = "p.value") if (is.null(x)) NA_real_ else unname(x[[w]])
+  tibble(resultado = et_res[y], p_bg = g(bg), p_wooldridge = g(wa), cd_estad = g(cd, "statistic"), p_cd = g(cd),
+         p_cd_anio = g(cd2), p_bp = g(bp))
+})
+diag_tab |> mutate(across(starts_with("p_"), fpt)) |>
+  kable(digits = 2, col.names = c("Resultado", "p Breusch-Godfrey (orden 1)", "p Wooldridge", "Estad. CD (EF país)", "p CD (EF país)", "p CD (EF país y año)", "p Breusch-Pagan"),
+        caption = "Diagnósticos de los residuos (valores p; H0: sin autocorrelación / sin dependencia / homocedasticidad)")
+```
+
+```{r diag-txt, include=FALSE}
+n_ser <- sum(diag_tab$p_bg < 0.05 | diag_tab$p_wooldridge < 0.05, na.rm = TRUE)
+n_cd  <- sum(diag_tab$p_cd < 0.05, na.rm = TRUE)
+n_cd2 <- sum(diag_tab$p_cd_anio < 0.05, na.rm = TRUE)
+n_bp  <- sum(diag_tab$p_bp < 0.05, na.rm = TRUE)
+```
+
+**Implicaciones.** `r n_ser` de 3 resultados muestran autocorrelación serial al 5 % en al menos una de las dos pruebas`r if (n_ser > 0) ": los residuos de un mismo país se parecen de un año al siguiente, de modo que los errores clásicos subestiman la incertidumbre y se justifica agrupar por país." else paste0("; aun así, con series de solo ", T_, " años estas pruebas tienen poca potencia y se conserva el agrupamiento por país por prudencia.")` La dependencia entre países en el mismo año es significativa en `r n_cd` de 3 resultados con efectos fijos de país`r if (n_cd > 0) paste0(" y en ", n_cd2, " de 3 al añadir efectos de año: ", if (n_cd2 < n_cd) "los efectos de año absorben buena parte de esa dependencia, lo que favorece la variante bidireccional." else "los efectos de año no la eliminan, y Driscoll-Kraay o el bootstrap por país son más prudentes que el clásico.") else paste0("; con efectos de año lo es en ", n_cd2, " de 3", ifelse(n_cd2 > 0, ", así que no se descarta algún shock común residual.", ", sin evidencia de shocks comunes no modelados."))` La heterocedasticidad es significativa en `r n_bp` de 3 resultados. **Qué errores creer:** con pocos grupos y estos problemas, el criterio más confiable es el **bootstrap salvaje por país** (no supone muchos grupos y respeta la correlación dentro de país), seguido del agrupado con $t_{G-1}$; Driscoll-Kraay se interpreta con cautela porque está pensado para series largas, y el error clásico no debe usarse para decidir.
+
+# Robustez
+
+Se repite la estimación principal (efectos fijos de país con tendencia) cambiando una decisión cada vez. En todas las variantes los valores p usan errores agrupados por país con distribución $t$ de (grupos - 1) grados de libertad: son menos exigentes que el bootstrap salvaje, de modo que sirven para comparar variantes entre sí, no para reemplazar la inferencia principal.
+
+```{r rob-datos}
+a_pdf <- function(d) pdata.frame(as.data.frame(d), index = c("pais", "ano"))
+est_rob <- function(etq, y, d, xvar = "div_z", extra = NULL, model = "within", effect = "individual", trend = TRUE) {
+  rhs <- c(xvar, if (trend) "t_c", extra)
+  m <- plm(as.formula(paste(y, "~", paste(rhs, collapse = " + "))), a_pdf(d), model = model, effect = effect)
+  vc <- vcovHC(m, method = "arellano", type = "HC1", cluster = "group")
+  Gm <- pdim(m)$nT$n; gl <- Gm - 1
+  b <- unname(coef(m)[xvar]); se <- sqrt(vc[xvar, xvar])
+  tibble(verificacion = etq, resultado = y, coef = b, se = se, p = 2 * pt(-abs(b / se), gl),
+         lo = b - qt(0.975, gl) * se, hi = b + qt(0.975, gl) * se, n = nobs(m), grupos = Gm)
+}
+
+# Años de crisis de Venezuela, definidos desde los datos: kcal por debajo del 85 % de su promedio
+# de los primeros cinco años (período previo estable de la serie)
+ven <- filter(panel, pais == "Venezuela")
+umbral_crisis <- 0.85
+base_ven <- mean(ven$kcal_dia_total[ven$ano < min(anios) + 5])
+anios_crisis <- ven$ano[ven$kcal_dia_total < umbral_crisis * base_ven]
+panel_sc <- filter(panel, !(pais == "Venezuela" & ano %in% anios_crisis))
+panel_lag <- panel |> group_by(pais) |> mutate(div_z_l1 = dplyr::lag(div_z)) |> ungroup() |> filter(!is.na(div_z_l1))
+ctrl_com <- c("ratio_dependencia_importaciones", "ratio_autosuficiencia")
+
+rob <- map_dfr(resultados, function(y) {
+  bind_rows(
+    est_rob("Base: efectos fijos de país + tendencia", y, panel),
+    est_rob("Efectos fijos de país y de año", y, panel, trend = FALSE, effect = "twoways"),
+    est_rob("Diversidad rezagada un año (t-1)", y, panel_lag, xvar = "div_z_l1"),
+    est_rob("Primeras diferencias", y, panel, model = "fd", trend = FALSE),
+    est_rob("Sin los años de crisis de Venezuela", y, panel_sc),
+    est_rob("Con controles de comercio (posibles mediadores)", y, panel, extra = ctrl_com))
+})
+loco <- map_dfr(resultados, function(y) map_dfr(paises, ~ est_rob(paste("Sin", .x), y, filter(panel, pais != .x))))
+
+categoria <- function(coef, p) ifelse(p >= 0.05, "No significativo", ifelse(coef > 0, "Significativo (+)", "Significativo (-)"))
+rob <- rob |> mutate(categoria = categoria(coef, p))
+loco <- loco |> mutate(categoria = categoria(coef, p))
+```
+
+## Años de crisis de Venezuela
+
+La energía disponible de Venezuela cae de forma abrupta en la segunda mitad de la década (promedio de los primeros cinco años: `r fm(base_ven)` kcal/día). Se consideran de crisis los años en que está por debajo de `r round(100 * umbral_crisis)` % de ese promedio: **`r paste(anios_crisis, collapse = ", ")`** (`r length(anios_crisis)` años; mínimo `r fm(min(ven$kcal_dia_total))` kcal/día en `r ven$ano[which.min(ven$kcal_dia_total)]`). El umbral es una decisión del análisis; la exclusión completa de Venezuela se evalúa más abajo en el análisis país por país.
+
+## Sin cada país
+
+```{r loco-fig, fig.height=7}
+loco |>
+  mutate(res = factor(et_res[resultado], levels = et_res), pais_excl = sub("^Sin ", "", verificacion)) |>
+  left_join(rob |> filter(str_starts(verificacion, "Base")) |> select(resultado, base = coef), by = "resultado") |>
+  ggplot(aes(coef, fct_rev(factor(pais_excl, levels = paises)), color = categoria)) +
+  geom_vline(aes(xintercept = base), linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, color = "black", linewidth = 0.3) +
+  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+  scale_color_manual(values = c("Significativo (+)" = "#1B9E77", "No significativo" = "grey50", "Significativo (-)" = "#D95F02"), name = NULL) +
+  facet_wrap(~res, scales = "free_x", ncol = 1) +
+  labs(title = "Dejar un país fuera cada vez: coeficiente de la diversidad (efectos fijos + tendencia)",
+       subtitle = "Línea discontinua: estimación con los diez países; IC 95 % con errores agrupados",
+       x = "Coeficiente por +1 DE de diversidad (unidades del resultado)", y = "País excluido", caption = fuente)
+```
+
+```{r rob-resumen}
+base_cat <- rob |> filter(str_starts(verificacion, "Base")) |> select(resultado, base_cat = categoria)
+filas_loco <- loco |> left_join(base_cat, by = "resultado") |> group_by(resultado) |>
+  summarise(verificacion = "Sin cada país (10 estimaciones; coef. = mediana; p = rango)", coef_med = median(coef),
+            p_min = min(p), p_max = max(p),
+            n_igual = sum(categoria == base_cat), n_sig = sum(p < 0.05), base_cat = first(base_cat), .groups = "drop") |>
+  mutate(igual = n_igual == length(paises), coef = coef_med, p = p_max,
+         p_txt = paste0(fpt(p_min), " a ", fpt(p_max)),
+         categoria = ifelse(igual, base_cat, paste0("Mixto: ", n_sig, " de ", length(paises), " significativos")))
+resumen_rob <- bind_rows(
+  rob |> filter(!str_starts(verificacion, "Base")) |> left_join(base_cat, by = "resultado") |>
+    mutate(igual = categoria == base_cat, p_txt = fpt(p)) |>
+    select(resultado, verificacion, coef, p, p_txt, categoria, base_cat, igual),
+  filas_loco |> select(resultado, verificacion, coef, p, p_txt, categoria, base_cat, igual)) |>
+  arrange(match(resultado, resultados))
+
+resumen_rob |>
+  transmute(Resultado = et_res[resultado], `Verificación` = verificacion, `Coef.` = coef, p = p_txt,
+            `Categoría en la verificación` = categoria, `Categoría en la base` = base_cat,
+            `¿Se mantiene el resultado?` = ifelse(igual, "Sí", "No")) |>
+  kable(digits = 2, caption = "¿Se mantiene el resultado? Comparación con la estimación base (misma categoría = mismo signo y misma significancia al 5 %)")
+```
+
+```{r rob-txt, include=FALSE}
+base_tab <- rob |> filter(str_starts(verificacion, "Base"))
+n_check <- n_distinct(resumen_rob$verificacion)
+mant <- resumen_rob |> group_by(resultado) |> summarise(n_igual = sum(igual), .groups = "drop")
+nm <- function(y) mant$n_igual[mant$resultado == y]
+sg <- function(y, v) rob$coef[rob$resultado == y & str_starts(rob$verificacion, v)]
+pv <- function(y, v) rob$p[rob$resultado == y & str_starts(rob$verificacion, v)]
+rng_loco <- function(y) range(loco$coef[loco$resultado == y])
+cat_base <- function(y) base_cat$base_cat[base_cat$resultado == y]
+frase_rob <- function(y) {
+  paste0("**", et_res[y], "** (base: ", tolower(cat_base(y)), "): el resultado se mantiene en ", nm(y), " de ", n_check, " verificaciones; dejando fuera un país por vez el coeficiente va de ",
+         f2(rng_loco(y)[1], 2), " a ", f2(rng_loco(y)[2], 2), " ", unid[y], "; con diversidad rezagada es ", fs(sg(y, "Diversidad rezagada"), 2), " (p ", fp(pv(y, "Diversidad rezagada")), "), en primeras diferencias ",
+         fs(sg(y, "Primeras diferencias"), 2), " (p ", fp(pv(y, "Primeras diferencias")), ") y sin los años de crisis de Venezuela ", fs(sg(y, "Sin los años"), 2), " (p ", fp(pv(y, "Sin los años")), ").")
+}
+```
+
+**Lectura de la robustez.** `r paste(map_chr(resultados, frase_rob), collapse = " ")` `r if (all(mant$n_igual == n_check)) "La conclusión es estable ante todas las verificaciones." else if (min(mant$n_igual) < n_check / 2) "Para al menos un resultado, la conclusión cambia en la mitad o más de las verificaciones: debe leerse como frágil." else "Algunas verificaciones cambian la categoría de algún resultado: las conclusiones son razonablemente estables pero no uniformes."`
+
+# Interpretación en lenguaje claro
+
+```{r clave-txt, include=FALSE}
+sig_k <- g1(inf_fe, k_y, m_wb, "sig"); sig_g <- g1(inf_fe, g_y, m_wb, "sig"); sig_q <- g1(inf_fe, q_y, m_wb, "sig")
+cs <- function(y) { if (!g1(inf_fe, y, m_wb, "sig")) "no muestra una asociación clara con" else if (g1(inf_fe, y, m_wb, "coef") > 0) "se asocia con valores más altos de" else "se asocia con valores más bajos de" }
+cambian_loco <- function(y) loco |> left_join(base_cat, by = "resultado") |> filter(resultado == y, categoria != base_cat) |>
+  pull(verificacion) |> sub(pattern = "^Sin ", replacement = "")
+fallan <- resumen_rob |> filter(!igual) |>
+  mutate(txt = ifelse(str_starts(verificacion, "Sin cada país"),
+                      paste0(et_res[resultado], " (al dejar fuera a ", sapply(resultado, function(y) paste(cambian_loco(y), collapse = " o ")), ")"),
+                      paste0(et_res[resultado], " (", tolower(verificacion), ")")))
+d_hol <- sum(inf_fe$sig_holm[inf_fe$metodo == m_wb])
+n_rob_ok <- sum(mant$n_igual == n_check)
+entre_vs_dentro <- if (any(sign(map_dbl(resultados, ~ cf(.x, "pooled"))) != sign(map_dbl(resultados, ~ cf(.x, "fe"))))) "incluso con signo distinto" else "con distinta magnitud"
+```
+
+1. **Dentro de cada país, la diversidad `r cs(k_y)` energía.** En los años en que un país tiene una oferta más diversa que su propio promedio, la energía disponible `r if (sig_k) paste0(ifelse(g1(inf_fe, k_y, m_wb, "coef") > 0, "es mayor", "es menor"), " en ", fm(abs(g1(inf_fe, k_y, m_wb, "coef"))), " kcal/día por cada +1 DE de diversidad (", f2(abs(g1(inf_fe, k_y, m_wb, "pct_media")), 1), " % de la media; p bootstrap ", fp(g1(inf_fe, k_y, m_wb, "p")), ")") else paste0("difiere en ", fs(g1(inf_fe, k_y, m_wb, "coef"), 0), " kcal/día por cada +1 DE, sin que la diferencia pueda distinguirse del azar (p bootstrap ", fp(g1(inf_fe, k_y, m_wb, "p")), ")")`. `r if (sig_k && !g1(inf_fe, k_y, m_rd, "sig")) "Esta conclusión no la confirma la enumeración exacta de Rademacher, así que es frágil." else if (sig_k) paste0("Resiste el bootstrap, y ", ifelse(g1(inf_fe, k_y, m_wb, "sig_holm"), "también resiste", "no resiste"), " la corrección de Holm entre los tres resultados.") else ""`
+2. **Grasa.** La diversidad `r cs(g_y)` grasa disponible (`r fs(g1(inf_fe, g_y, m_wb, "coef"), 1)` g/día por +1 DE; p bootstrap `r fp(g1(inf_fe, g_y, m_wb, "p"))`, p Holm `r fp(g1(inf_fe, g_y, m_wb, "p_holm"))`). `r if (sig_k && sig_g) "Energía y grasa se mueven juntas, lo cual es esperable: la grasa aporta una parte importante de las calorías y, además, el índice de diversidad se calcula con la misma oferta que ellas, por lo que la relación puede ser en parte mecánica." else ""`
+3. **Calidad.** `r if (!sig_q) paste0("No hay evidencia clara de que la diversidad se asocie con la calidad de la oferta (", fs(g1(inf_fe, q_y, m_wb, "coef"), 2), " puntos por +1 DE; p bootstrap ", fp(g1(inf_fe, q_y, m_wb, "p")), "). Leído junto con los resultados anteriores: ", if (sig_k || sig_g) "la diversificación se relaciona con la **cantidad** de energía y grasa, no con la **calidad** según este índice parcial." else "la diversidad no muestra una asociación clara ni con la cantidad ni con la calidad.") else paste0("La diversidad se asocia con ", ifelse(g1(inf_fe, q_y, m_wb, "coef") > 0, "mayor", "menor"), " calidad de la oferta (", fs(g1(inf_fe, q_y, m_wb, "coef"), 2), " puntos por +1 DE; p bootstrap ", fp(g1(inf_fe, q_y, m_wb, "p")), "), aunque el índice es parcial (solo frutas y hortalizas y grasa) y tiene efecto techo.")`
+4. **Qué tan sólido es.** El modelo agrupado (que mezcla comparaciones entre países) y el de efectos fijos dan coeficientes distintos (`r entre_vs_dentro` en al menos un resultado), por lo que comparar países y comparar un país consigo mismo no responden la misma pregunta. La prueba de Hausman rechaza los efectos aleatorios en `r n_haus_rech` de 3 resultados. Con inferencia robusta para pocos grupos, `r n_sig_wb` de 3 asociaciones son significativas (`r d_hol` tras Holm). En la robustez, el patrón base se conserva en todas las verificaciones para `r n_rob_ok` de 3 resultados`r if (nrow(fallan) > 0) paste0("; las verificaciones que lo cambian son: ", paste(fallan$txt, collapse = "; "), ". ", if (any(str_detect(fallan$verificacion, "Primeras") & fallan$resultado == k_y)) "En primeras diferencias (cambios de un año a otro) la asociación con la energía no se sostiene: la relación parece estar más en los niveles que en los movimientos anuales, que son ruidosos. " else "") else ". "` `r if (n_sig_wb == 0) "Con diez países, ninguna asociación supera una inferencia exigente: ausencia de evidencia no es evidencia de ausencia, porque la potencia es baja." else if (n_rob_ok < 3) "Las conclusiones deben presentarse con la cautela que corresponde a un panel de diez países." else "Aun así, son diez países y las conclusiones se mantienen asociacionales."`
+
+## Qué significa para la política alimentaria
+
+`r if (sig_k || sig_g) paste0("Los datos son compatibles con que, en un mismo país, los años de oferta más diversa vayan acompañados de más ", paste(c(if (sig_k) "energía", if (sig_g) "grasa"), collapse = " y "), " disponibles. Eso es coherente con una oferta que se amplía y se enriquece en general, pero ") else "Los datos no muestran, dentro de cada país, una asociación clara entre la diversidad y los nutrientes analizados. "` `r if (!sig_q) "no respaldan usar la diversidad de la oferta, por sí sola, como indicador o meta de calidad nutricional: diversificar la oferta no garantiza una dieta de mejor calidad según el índice usado. " else "la calidad del índice parcial sí aparece asociada, aunque ese índice solo cubre dos dimensiones. "`Además, "más energía" o "más grasa" no son necesariamente mejores: según el país, pueden significar corregir un déficit o agravar un exceso. Lo que la evidencia sí permite decir es que conviene seguir **indicadores de calidad separados** (frutas y hortalizas, proporción de energía de grasa) y no inferir calidad a partir de la variedad. Nada de lo anterior establece que una política de diversificación *cause* esos cambios: son asociaciones entre medias nacionales de disponibilidad, no de consumo.
+
+# Pronóstico breve de la energía (ruta secundaria)
+
+El informe v3 dejó la ruta predictiva como análisis secundario y acotado. Aquí se compara, para la energía disponible de cada país, tres modelos contra la referencia ingenua, usando solo la serie de cada país (no la diversidad), con `r T_` puntos por serie.
+
+- **Ingenuo**: el pronóstico es el último valor observado.
+- **Deriva**: último valor más el cambio medio anual histórico (*random walk with drift*).
+- **Suavizamiento exponencial de Holt**: nivel y pendiente suavizados (`stats::HoltWinters`, sin estacionalidad; los parámetros se estiman por mínimos cuadrados).
+- **ARIMA**: de entre ARIMA(p,1,q) con p y q en {0,1}, con y sin deriva, se elige el de menor AICc en la ventana de entrenamiento (`stats::arima`; se fija una diferenciación porque las series tienen tendencia y son demasiado cortas para pruebas de raíz unitaria fiables). Si algún ajuste falla se usa el ingenuo y se cuenta.
+
+**Validación estrictamente temporal.** No se usa validación cruzada con particiones aleatorias: filtraría información del futuro al pasado (años vecinos del mismo país caerían en entrenamiento y en prueba) y, como las series son persistentes, inflaría el desempeño. Se usan (i) una partición fija (entrenar hasta 2020, evaluar 2021-2023) y (ii) **orígenes móviles** (entrenar con todo hasta el origen y pronosticar hasta tres años adelante, para orígenes desde 2016).
+
+```{r pronostico-fun}
+z95 <- qnorm(0.975)
+fallos <- new.env(); fallos$n <- 0
+pron_uno <- function(y, h, modelo) {
+  n <- length(y); hh <- seq_len(h)
+  ing <- function(fb = FALSE) { if (fb) fallos$n <- fallos$n + 1; list(m = rep(y[n], h), s = sd(diff(y)) * sqrt(hh)) }
+  switch(modelo,
+    naive = ing(),
+    deriva = { dr <- (y[n] - y[1]) / (n - 1); s <- sd(diff(y) - dr)
+               list(m = y[n] + dr * hh, s = s * sqrt(hh * (1 + hh / (n - 1)))) },
+    holt = tryCatch({
+      f <- HoltWinters(ts(y), gamma = FALSE)
+      pr <- predict(f, n.ahead = h, prediction.interval = TRUE, level = 0.95)
+      list(m = as.numeric(pr[, "fit"]), s = (as.numeric(pr[, "upr"]) - as.numeric(pr[, "fit"])) / z95)
+    }, error = function(e) ing(TRUE)),
+    arima = tryCatch({
+      tt <- seq_len(n)
+      cand <- expand_grid(p = 0:1, q = 0:1, dr = c(FALSE, TRUE))
+      # xreg = tt se escribe literal para que predict() pueda reevaluar la llamada
+      ajs <- pmap(cand, function(p, q, dr) tryCatch(
+        if (dr) arima(y, order = c(p, 1, q), xreg = tt, method = "ML") else arima(y, order = c(p, 1, q), method = "ML"),
+        error = function(e) NULL))
+      aicc <- map_dbl(ajs, function(a) { if (is.null(a)) return(Inf); k <- length(coef(a)) + 1; ne <- n - 1
+        if (ne - k - 1 <= 0) Inf else a$aic + 2 * k * (k + 1) / (ne - k - 1) })
+      j <- which.min(aicc); if (!is.finite(aicc[j])) stop("sin ajuste")
+      pr <- predict(ajs[[j]], n.ahead = h, newxreg = if (cand$dr[j]) n + hh else NULL)
+      list(m = as.numeric(pr$pred), s = as.numeric(pr$se))
+    }, error = function(e) ing(TRUE)))
+}
+modelos <- c(naive = "Ingenuo (último valor)", deriva = "Deriva", holt = "Holt (suavizamiento exponencial)", arima = "ARIMA (mejor AICc)")
+series <- split(panel$kcal_dia_total, panel$pais)
+origenes <- 2016:(max(anios) - 1)
+H <- 3
+
+evalu <- expand_grid(pais = paises, origen = origenes, modelo = names(modelos)) |>
+  mutate(res = pmap(list(pais, origen, modelo), function(p, o, m) {
+    y <- series[[p]][anios <= o]; h <- min(H, max(anios) - o)
+    pr <- pron_uno(y, h, m)
+    tibble(h = seq_len(h), ano = o + seq_len(h), pred = pr$m, real = series[[p]][match(o + seq_len(h), anios)])
+  })) |> unnest(res) |>
+  mutate(err = real - pred, ae = abs(err), ape = 100 * abs(err) / real)
+origen_fijo <- 2020
+```
+
+```{r pronostico-tabla}
+metr <- function(d) d |> group_by(modelo) |> summarise(MAE = mean(ae), MAPE = mean(ape), n = n(), .groups = "drop") |>
+  arrange(match(modelo, names(modelos)))   # el ingenuo va primero: en un empate gana la referencia más simple
+m_fijo <- evalu |> filter(origen == origen_fijo) |> metr()
+m_rod  <- evalu |> metr()
+m_rod_sv <- evalu |> filter(pais != "Venezuela") |> metr()
+tab_pron <- tibble(Modelo = modelos[m_fijo$modelo],
+                   `MAE partición fija (kcal)` = m_fijo$MAE, `MAPE partición fija (%)` = m_fijo$MAPE,
+                   `MAE orígenes móviles (kcal)` = m_rod$MAE[match(m_fijo$modelo, m_rod$modelo)],
+                   `MAPE orígenes móviles (%)` = m_rod$MAPE[match(m_fijo$modelo, m_rod$modelo)],
+                   `MAE móviles sin Venezuela (kcal)` = m_rod_sv$MAE[match(m_fijo$modelo, m_rod_sv$modelo)])
+kable(tab_pron, digits = 2, caption = paste0("Error de pronóstico de la energía (kcal/día): partición fija (", origen_fijo + 1, "-", max(anios), ", ", unique(m_fijo$n), " pronósticos por modelo) y orígenes móviles (", unique(m_rod$n), " pronósticos por modelo)"))
+```
+
+```{r pron-pais}
+evalu |> filter(origen == origen_fijo) |> group_by(modelo, pais) |> summarise(MAE = mean(ae), .groups = "drop") |>
+  mutate(modelo = modelos[modelo]) |> pivot_wider(names_from = pais, values_from = MAE) |>
+  kable(digits = 0, caption = paste0("MAE por país en la partición fija (kcal/día): conviene ver dónde se concentra el error"))
+```
+
+```{r pron-txt, include=FALSE}
+gan_rod  <- m_rod$modelo[which.min(m_rod$MAE)]; gan_fijo <- m_fijo$modelo[which.min(m_fijo$MAE)]
+mae_gan  <- min(m_rod$MAE); mae_naive <- m_rod$MAE[m_rod$modelo == "naive"]
+mape_gan <- m_rod$MAPE[m_rod$modelo == gan_rod]
+mejora   <- 100 * (1 - mae_gan / mae_naive)
+pais_peor <- evalu |> filter(origen == origen_fijo, modelo == gan_rod) |> group_by(pais) |> summarise(MAE = mean(ae), .groups = "drop") |> slice_max(MAE, n = 1)
+gan_sv <- m_rod_sv$modelo[which.min(m_rod_sv$MAE)]
+```
+
+**Resultado de la validación.** Con orígenes móviles el modelo de menor error absoluto medio es **`r modelos[gan_rod]`** (MAE = `r f2(mae_gan, 1)` kcal/día; MAPE = `r f2(mape_gan, 2)` %), `r if (gan_rod == "naive") "es decir, ningún modelo supera a repetir el último valor." else paste0("con una mejora de ", f2(mejora, 1), " % respecto del ingenuo (MAE = ", f2(mae_naive, 1), " kcal/día).")` `r if (gan_rod == "naive" || mejora < 5) "La diferencia con la referencia ingenua es pequeña o nula: con tan pocos puntos por país, un modelo más complejo no aporta una ventaja clara. " else ""`En la partición fija el mejor es `r modelos[gan_fijo]` `r if (gan_fijo == gan_rod) "(el mismo modelo)." else "(distinto del anterior: el ranking depende de la validación)."` `r if (gan_sv != gan_rod) paste0("Sin Venezuela, el mejor sería ", modelos[gan_sv], ". ") else "Sin Venezuela, el mejor sigue siendo el mismo. "`Con el modelo ganador, el país con mayor error en la partición fija es `r pais_peor$pais` (MAE de `r fm(pais_peor$MAE)` kcal/día)`r if (pais_peor$pais == "Venezuela") paste0(": su energía pasó de ", fm(ven$kcal_dia_total[ven$ano == origen_fijo]), " kcal/día en ", origen_fijo, " a ", fm(ven$kcal_dia_total[ven$ano == max(anios)]), " en ", max(anios), ", un cambio que ningún modelo univariado entrenado con datos hasta ", origen_fijo, " anticipa") else ""`. `r if (fallos$n > 0) paste0("En ", fallos$n, " ajustes de Holt o ARIMA hubo que recurrir al pronóstico ingenuo por falla del ajuste.") else "Todos los ajustes de Holt y ARIMA convergieron sin recurrir al pronóstico ingenuo de respaldo."`
+
+## Pronóstico 2024-2026
+
+Se reajusta el modelo ganador de la validación móvil (`r modelos[gan_rod]`) con toda la serie de cada país y con el promedio regional, y se proyectan tres años con intervalos de predicción al 95 %. Los intervalos son anchos porque la serie es corta y los modelos suponen que el pasado reciente se mantiene (no recogen otro quiebre como el de Venezuela).
+
+```{r pron-final, fig.height=7.5}
+reg <- panel |> group_by(ano) |> summarise(kcal = mean(kcal_dia_total), .groups = "drop")
+ser_all <- c(series, list(`Promedio regional` = reg$kcal))
+fut <- map_dfr(names(ser_all), function(p) {
+  y <- ser_all[[p]]; pr <- pron_uno(y, H, gan_rod)
+  tibble(pais = p, ano = max(anios) + seq_len(H), m = pr$m, lo = pr$m - z95 * pr$s, hi = pr$m + z95 * pr$s)
+})
+hist_df <- bind_rows(panel |> transmute(pais, ano, kcal = kcal_dia_total), reg |> mutate(pais = "Promedio regional"))
+orden_f <- c(paises, "Promedio regional")
+ggplot() +
+  geom_ribbon(data = fut, aes(ano, ymin = lo, ymax = hi), fill = "#62B6CB", alpha = 0.35) +
+  geom_line(data = hist_df, aes(ano, kcal), color = "grey20") +
+  geom_line(data = fut, aes(ano, m), color = "#1B4965", linewidth = 1, linetype = "dashed") +
+  geom_point(data = fut, aes(ano, m), color = "#1B4965", size = 1.2) +
+  facet_wrap(~factor(pais, levels = orden_f), scales = "free_y", ncol = 4) +
+  scale_x_continuous(breaks = c(2010, 2016, 2023)) +
+  labs(title = paste0("Energía disponible: observado y pronóstico ", max(anios) + 1, "-", max(anios) + H, " (", modelos[gan_rod], ")"),
+       subtitle = "Línea discontinua: pronóstico; banda: intervalo de predicción al 95 %",
+       x = NULL, y = "kcal/día", caption = fuente)
+```
+
+```{r pron-reg}
+fut |> filter(pais == "Promedio regional") |>
+  transmute(`Año` = ano, `Pronóstico (kcal/día)` = m, `Límite inferior 95 %` = lo, `Límite superior 95 %` = hi) |>
+  kable(digits = 0, caption = "Promedio regional de energía (media simple de los diez países): pronóstico con intervalo al 95 %")
+```
+
+```{r pron-reg-txt, include=FALSE}
+fr <- filter(fut, pais == "Promedio regional")
+anch <- fr$hi[H] - fr$lo[H]
+ult_reg <- reg$kcal[nrow(reg)]
+```
+
+El pronóstico del promedio regional para `r fr$ano[H]` es de `r fm(fr$m[H])` kcal/día (intervalo `r fm(fr$lo[H])` a `r fm(fr$hi[H])`), `r if (abs(fr$m[H] - ult_reg) < 0.5) "igual al" else if (fr$m[H] > ult_reg) "por encima del" else "por debajo del"` último dato observado (`r fm(ult_reg)` en `r max(anios)`); el intervalo mide `r fm(anch)` kcal/día de ancho, es decir, `r f2(100 * anch / ult_reg, 1)` % del nivel. Es un ejercicio de apoyo: el objetivo principal del informe es el diagnóstico.
+
+# Limitaciones
+
+- **Solo `r G` países.** La inferencia con pocos grupos es frágil por naturaleza: aun el bootstrap salvaje tiene poca potencia, y un resultado "no significativo" no demuestra que no haya relación.
+- **Disponibilidad no es consumo.** Las Hojas de Balance de Alimentos miden la oferta nacional disponible (producción + importaciones - exportaciones - otros usos), no lo que come cada persona; no reflejan acceso, desigualdad ni desperdicio.
+- **Posibles revisiones metodológicas.** La FAO revisa sus series; los saltos de algunos países (Venezuela, exportaciones de Brasil en el último año) pueden reflejar cambios de registro y no de la oferta real.
+- **Variables omitidas.** No hay ingreso, precios, población ni clima. Pueden mover a la vez la diversidad y los nutrientes; los efectos fijos solo controlan lo que no cambia en el tiempo, y la tendencia o los efectos de año solo lo que es común a todos los países.
+- **Relación parcialmente mecánica.** El índice de diversidad y la energía, la grasa y el índice de calidad provienen de la misma oferta (el índice de calidad usa la proporción de energía de grasa): parte de la asociación puede ser aritmética y no económica o conductual.
+- **Series cortas.** `r T_` años por país: Driscoll-Kraay y las pruebas de autocorrelación son aproximadas, y el pronóstico se apoya en muy pocos puntos.
+- **Causalidad inversa y simultaneidad.** Más energía disponible podría ampliar la variedad (y no al revés); el rezago de un año mitiga el orden temporal pero no resuelve la causalidad.
+- **Proteína fuera del panel.** No se evalúa dentro de cada país.
+- **Índice de calidad parcial.** Solo incluye frutas y hortalizas y energía de grasa, con efecto techo.
+
+# Conclusión
+
+`r paste0("Dentro de cada país, entre ", min(anios), " y ", max(anios), ", la diversidad de la oferta ", cs(k_y), " energía (", fs(g1(inf_fe, k_y, m_wb, "coef"), 0), " kcal/día por +1 DE; p bootstrap ", fp(g1(inf_fe, k_y, m_wb, "p")), "), ", cs(g_y), " grasa (", fs(g1(inf_fe, g_y, m_wb, "coef"), 1), " g/día; p ", fp(g1(inf_fe, g_y, m_wb, "p")), ") y ", cs(q_y), " calidad (", fs(g1(inf_fe, q_y, m_wb, "coef"), 2), " puntos; p ", fp(g1(inf_fe, q_y, m_wb, "p")), "). ")`El resultado `r if (n_rob_ok == 3) "se mantiene en todas las verificaciones de robustez" else paste0("se mantiene en todas las verificaciones de robustez para ", n_rob_ok, " de 3 resultados")`, y se interpreta siempre como **asociación**, no como efecto causal. `r if (!sig_q && (sig_k || sig_g)) "La lectura más prudente es que diversificar la oferta se relaciona con más cantidad, no con mejor calidad medida con este índice. " else ""`En el pronóstico secundario, `r if (gan_rod == "naive") "repetir el último valor no es superado por los modelos más elaborados" else paste0("el modelo ", modelos[gan_rod], " obtiene el menor error (", f2(mejora, 1), " % menos que el ingenuo)")``r if (gan_rod == "naive" || mejora < 5) "; con series tan cortas es esperable que no haya ventaja material sobre la referencia ingenua." else "."` Como siguiente paso, ampliar la muestra (más países y años) e incorporar ingreso y precios aumentaría la potencia y permitiría separar mejor la diversidad de los factores que la acompañan.
+
+# Referencias
+
+- FAO. *FAOSTAT: base de datos estadísticos de la FAO*. https://www.fao.org/faostat
+- Wooldridge, J. M. (2010). *Econometric Analysis of Cross Section and Panel Data* (2.ª ed.). MIT Press.
+- Cameron, A. C., Gelbach, J. B. y Miller, D. L. (2008). Bootstrap-based improvements for inference with clustered errors. *Review of Economics and Statistics*, 90(3), 414-427.
+- Webb, M. D. (2014). Reworking wild bootstrap based inference for clustered errors. *Queen's Economics Department Working Paper* 1315.
+- Driscoll, J. C. y Kraay, A. C. (1998). Consistent covariance matrix estimation with spatially dependent panel data. *Review of Economics and Statistics*, 80(4), 549-560.
+- Croissant, Y. y Millo, G. (2008). Panel data econometrics in R: the plm package. *Journal of Statistical Software*, 27(2).
+- Hyndman, R. J. y Athanasopoulos, G. (2021). *Forecasting: Principles and Practice* (3.ª ed.). OTexts.
+
+# Anexo: información de sesión
+
+```{r sesion}
+sessionInfo()
+```
