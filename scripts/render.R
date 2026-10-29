@@ -9,7 +9,7 @@ arch  <- sub("^--file=", "", args[grepl("^--file=", args)])
 raiz  <- if (length(arch)) normalizePath(file.path(dirname(arch[1]), "..")) else getwd()
 setwd(raiz)
 
-informes <- c("01_descriptivo", "02_diagnostico")
+informes <- c("01_descriptivo", "02_diagnostico", "03_multivariado")
 for (i in informes) {
   rmarkdown::render(
     input         = file.path("analysis", paste0(i, ".Rmd")),

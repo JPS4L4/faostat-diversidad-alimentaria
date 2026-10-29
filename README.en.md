@@ -2,7 +2,7 @@
 
 A 10-country South American panel to ask whether the years with a more diverse food supply are also years with more energy, more fat and better quality. Two R Markdown reports, processed data and all the code to reproduce them.
 
-[Versión en español](README.md) · Live reports (in Spanish): <https://jps4l4.github.io/faostat-diversidad-alimentaria/> *(provisional link: it will work once the repository is published)*
+[Versión en español](README.md) · Live reports (in Spanish): <https://jps4l4.github.io/faostat-diversidad-alimentaria/>
 
 ## The question
 
@@ -28,6 +28,10 @@ A 10-country South American panel to ask whether the years with a more diverse f
 - Robustness: year effects, first differences, lagged diversity, leave-one-country-out, dropping Venezuela's crisis years.
 - A short energy forecast: naive vs Holt vs ARIMA, with strictly temporal validation (fixed split and rolling origins).
 
+**3. Multivariate** ([report](https://jps4l4.github.io/faostat-diversidad-alimentaria/03_multivariado.html)).
+- **Interdependence:** PCA of the 13 food groups (with KMO and Bartlett), on the raw data and on country-demeaned data; Ward clustering on the retained components.
+- **Dependence:** multivariate linear regression (MANCOVA) of energy, fat and quality jointly, with country fixed effects; Pillai test, canonical variate and a joint Wald test with the wild cluster bootstrap.
+
 ## Key findings
 
 These are **associations**, not causal effects.
@@ -37,6 +41,8 @@ These are **associations**, not causal effects.
 - **It is fragile.** With year effects none of the associations survive Holm. In first differences the energy effect disappears (-14.5 kcal; p = 0.53), while the fat effect holds.
 - **Between countries (n = 10)** no association survives Holm.
 - **Hausman** does not reject random effects, with low power; fixed effects are kept.
+- **Supply patterns:** composition is mostly a country trait (median 93% of the variance is between countries). The 6 clusters (silhouette 0.58) are country typologies, not periods. Within countries there is a general supply-expansion axis that correlates 0.86 with energy but only 0.51 with diversity.
+- **Joint test:** Pillai gives p < 0.001, but the wild cluster bootstrap gives p = 0.064 (trend) and 0.083 (year effects). With 10 countries the joint evidence is weak and the association is concentrated in fat.
 - **Forecast:** repeating the last value beats Holt and ARIMA (rolling-origin MAE 35.7 kcal/day; MAPE 1.27%). Regional average for 2026: about 2,996 kcal/day [2,920 – 3,072].
 
 ![Diversity and energy within countries](docs/img/diversidad_vs_energia.png)
@@ -52,7 +58,7 @@ Figures are labelled in Spanish; the reports are in Spanish.
 ## Structure
 
 ```
-analysis/        01_descriptivo.Rmd, 02_diagnostico.Rmd
+analysis/        01_descriptivo.Rmd, 02_diagnostico.Rmd, 03_multivariado.Rmd
 data/processed/  3 CSV files (country-year panel, country indicators, PCA and clusters)
 data/raw/        pending (see its README)
 docs/            HTML reports, landing page and figures (GitHub Pages)
@@ -63,10 +69,10 @@ scripts/         render.R (reports) and figures.R (figures)
 
 Requires R 4.6 (tested with 4.6.1) and [Pandoc](https://pandoc.org/) (bundled with RStudio).
 
-Packages: `tidyverse`, `janitor`, `plm`, `sandwich`, `lmtest`, `knitr`, `rmarkdown`, `DT`, `corrplot`, `factoextra`, `cluster`, `ggrepel`, `moments`; `ragg` is optional.
+Packages: `tidyverse`, `janitor`, `plm`, `sandwich`, `lmtest`, `knitr`, `rmarkdown`, `DT`, `corrplot`, `factoextra`, `cluster`, `ggrepel`, `moments`, `FactoMineR`, `psych`, `car`; `ragg` is optional.
 
 ```
-Rscript scripts/render.R     # builds docs/01_descriptivo.html and docs/02_diagnostico.html
+Rscript scripts/render.R     # builds docs/01_descriptivo.html, 02_diagnostico.html and 03_multivariado.html
 Rscript scripts/figures.R    # rebuilds docs/img/*.png
 ```
 

@@ -2,7 +2,7 @@
 
 Un panel de 10 países sudamericanos para preguntarse si los años en que la oferta de alimentos es más diversa son también años con más energía, grasa y calidad. Dos informes en R Markdown, datos procesados y todo el código para reproducirlos.
 
-[English version](README.en.md) · Informes en línea: <https://jps4l4.github.io/faostat-diversidad-alimentaria/> *(enlace provisional: se activará al publicar el repositorio)*
+[English version](README.en.md) · Informes en línea: <https://jps4l4.github.io/faostat-diversidad-alimentaria/>
 
 ## La pregunta
 
@@ -28,6 +28,10 @@ Importa porque "más variedad" suele leerse como "mejor dieta". Aquí se pone a 
 - Robustez: efectos de año, primeras diferencias, diversidad rezagada, quitar un país a la vez, quitar los años de crisis de Venezuela.
 - Pronóstico breve de la energía: ingenuo contra Holt y ARIMA, con validación estrictamente temporal (partición fija y orígenes móviles).
 
+**3. Multivariado** ([informe](https://jps4l4.github.io/faostat-diversidad-alimentaria/03_multivariado.html)).
+- **Interdependencia:** ACP de los 13 grupos de alimentos (con KMO y Bartlett), con los datos originales y centrados por país; conglomerados de Ward sobre los componentes retenidos.
+- **Dependencia:** regresión lineal multivariada (MANCOVA) de energía, grasa y calidad a la vez, con efectos fijos de país; prueba de Pillai, variable canónica y prueba de Wald conjunta con bootstrap salvaje por país.
+
 ## Resultados principales
 
 Son **asociaciones**, no efectos causales.
@@ -37,6 +41,8 @@ Son **asociaciones**, no efectos causales.
 - **Es frágil.** Con efectos de año ninguna asociación sobrevive a Holm. En primeras diferencias el efecto sobre la energía desaparece (-14,5 kcal; p = 0,53), mientras que el de la grasa se mantiene.
 - **Entre países (n = 10)** ninguna asociación sobrevive a Holm.
 - **Hausman** no rechaza efectos aleatorios, con poca potencia; se conservan los efectos fijos.
+- **Patrones de oferta:** la composición es sobre todo un rasgo de cada país (mediana de 93 % de la varianza entre países). Los 6 conglomerados (silueta 0,58) son tipologías de países, no etapas. Dentro de cada país aparece un eje de expansión general de la oferta que se correlaciona 0,86 con la energía pero solo 0,51 con la diversidad.
+- **Prueba conjunta:** Pillai da p < 0,001, pero el bootstrap salvaje por país da p = 0,064 (tendencia) y 0,083 (efectos de año). Con 10 países, la evidencia conjunta es débil y la asociación se concentra en la grasa.
 - **Pronóstico:** repetir el último valor supera a Holt y ARIMA (MAE en orígenes móviles 35,7 kcal/día; MAPE 1,27 %). Para el promedio regional en 2026: ≈ 2 996 kcal/día [2 920 – 3 072].
 
 ![Diversidad y energía dentro de cada país](docs/img/diversidad_vs_energia.png)
@@ -50,7 +56,7 @@ Son **asociaciones**, no efectos causales.
 ## Estructura
 
 ```
-analysis/        01_descriptivo.Rmd, 02_diagnostico.Rmd
+analysis/        01_descriptivo.Rmd, 02_diagnostico.Rmd, 03_multivariado.Rmd
 data/processed/  3 CSV (panel país-año, indicadores por país, PCA y clústeres)
 data/raw/        pendiente (ver su README)
 docs/            informes HTML, página de inicio y figuras (GitHub Pages)
@@ -61,10 +67,10 @@ scripts/         render.R (informes) y figures.R (figuras)
 
 Requiere R 4.6 (probado con 4.6.1) y [Pandoc](https://pandoc.org/) (viene con RStudio).
 
-Paquetes: `tidyverse`, `janitor`, `plm`, `sandwich`, `lmtest`, `knitr`, `rmarkdown`, `DT`, `corrplot`, `factoextra`, `cluster`, `ggrepel`, `moments`; `ragg` es opcional.
+Paquetes: `tidyverse`, `janitor`, `plm`, `sandwich`, `lmtest`, `knitr`, `rmarkdown`, `DT`, `corrplot`, `factoextra`, `cluster`, `ggrepel`, `moments`, `FactoMineR`, `psych`, `car`; `ragg` es opcional.
 
 ```
-Rscript scripts/render.R     # genera docs/01_descriptivo.html y docs/02_diagnostico.html
+Rscript scripts/render.R     # genera docs/01_descriptivo.html, 02_diagnostico.html y 03_multivariado.html
 Rscript scripts/figures.R    # regenera docs/img/*.png
 ```
 
