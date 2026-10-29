@@ -1,0 +1,655 @@
+---
+title: " ¿La diversificación de la oferta
+alimentaria está asociada con una mayor
+disponibilidad de nutrientes?"
+author: 
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5,
+  fig.align = "center"
+)
+
+# --- Paquetes ---------------------------------------------------------
+
+library(tidyverse)   # manipulación y gráficos
+library(janitor)     # limpieza de nombres de columnas
+library(skimr)       # resumen estadístico rápido
+library(DT)          # tablas interactivas
+library(corrplot)    # matriz de correlación
+library(factoextra)  # visualización de PCA / clusters
+library(cluster)      # silhouette
+library(moments)     # asimetría y curtosis
+library(GGally)      # ggpairs
+
+theme_set(theme_minimal(base_size = 13))
+
+# Paleta de colores consistente para todo el informe (más "de marca", menos
+# colores por defecto de ggplot)
+paleta_paises <- c("#1B4965","#5FA8D3","#62B6CB","#BEE9E8","#F4A261",
+                    "#E76F51","#2A9D8F","#264653","#E9C46A","#9B5DE5")
+theme_informe <- theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(color = "grey40", size = 11),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank())
+theme_set(theme_informe)
+```
+
+```{r logo-itm, echo=FALSE, results='asis'}
+# Coloca el archivo "LOGO_ITM_2020-04.png" en la MISMA carpeta que este .Rmd
+cat('<div style="text-align:right;"><img src="LOGO_ITM_2020-04.png" style="width:150px;"></div>')
+```
+
+# Introducción
+
+Este informe forma parte de un trabajo de **minería de datos** sobre la oferta
+alimentaria de 10 países de Sudamérica (Argentina, Bolivia, Brasil, Chile,
+Colombia, Ecuador, Paraguay, Perú, Uruguay y Venezuela). Se trabaja con tres
+fuentes de datos que representan distintos niveles de agregación del mismo
+fenómeno:
+
+| Dataset | Granularidad | Filas | Descripción |
+|---|---|---|---|
+| `paises_definitivo_kpis` | 1 fila por país | 10 | KPIs agregados (promedio del período) |
+| `paises_pca_clusters` | 1 fila por país | 10 | Igual al anterior + componentes principales (`PC1`,`PC2`) y clúster (`Cluster_KMeans`) |
+| `panel_pais_anio_definitivo` | 1 fila por país-año | 140 | Panel 2010-2023 con indicadores de comercio exterior y clúster asignado |
+
+Los objetivos del análisis son:
+
+1. Evaluar la **calidad** de los datos (valores faltantes, duplicados, atípicos, consistencia entre datasets).
+2. Estudiar la **distribución** de las variables clave (forma, dispersión, normalidad).
+3. Analizar la **diversidad** de la oferta alimentaria entre países y en el tiempo.
+4. Revisar la reducción de dimensionalidad (**PCA**) y la **segmentación** (clustering) ya calculadas.
+5. Explorar la **dinámica temporal** (panel 2010-2023): comercio, autosuficiencia, dependencia.
+
+# Carga de datos
+
+```{r carga}
+kpis    <- read_csv("paises_definitivo_kpis.csv")    |> clean_names()
+pca_cl  <- read_csv("paises_pca_clusters.csv")        |> clean_names()
+panel   <- read_csv("panel_pais_anio_definitivo.csv") |> clean_names()
+
+# clean_names() deja columnas como "aceites_vegetales", "almidon_de_raices",
+# "cereales_exc_cerveza", "pais", "ano", etc. La columna "Cluster_KMeans"
+# puede quedar como "cluster_kmeans" o "cluster_k_means" según la versión
+# de janitor instalada -> la normalizamos explícitamente para que el resto
+# del script no dependa de adivinar el nombre exacto.
+names(pca_cl) <- str_replace(names(pca_cl), "^cluster.*means$", "cluster_kmeans")
+
+glimpse(kpis)
+```
+
+> **Nota:** coloca los tres CSV en la misma carpeta que este `.Rmd` (o ajusta
+> la ruta en `read_csv()`). `read_csv()` maneja automáticamente el BOM UTF-8
+> que traen los archivos originales.
+
+# Resumen visual
+
+_Antes de entrar en el detalle técnico, estos cuatro gráficos resumen los
+hallazgos principales del estudio._
+
+```{r resumen-diversidad, fig.height=4.5}
+kpis |>
+  ggplot(aes(x = fct_reorder(pais, food_diversity_index), y = food_diversity_index,
+             fill = pais)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = paleta_paises) +
+  coord_flip() +
+  labs(title = "¿Qué países tienen la dieta más diversa?",
+       subtitle = "Índice de diversidad alimentaria (Food Diversity Index)",
+       x = NULL, y = NULL)
+```
+📊 **Lectura rápida:** Brasil y Chile encabezan la diversidad alimentaria;
+Ecuador y Bolivia son los que menos variedad de grupos de alimentos ofrecen.
+
+```{r resumen-calorias, fig.height=4.5}
+panel |>
+  group_by(ano) |>
+  summarise(kcal_regional = mean(kcal_dia_total)) |>
+  ggplot(aes(x = ano, y = kcal_regional)) +
+  geom_area(fill = "#62B6CB", alpha = 0.4) +
+  geom_line(color = "#1B4965", linewidth = 1.2) +
+  geom_point(color = "#1B4965", size = 2) +
+  labs(title = "La oferta calórica regional ha subido de forma sostenida",
+       subtitle = "Promedio de kcal/día disponibles, 10 países (2010-2023)",
+       x = NULL, y = "Kcal/día (promedio regional)")
+```
+📊 **Lectura rápida:** la disponibilidad calórica promedio de la región
+muestra una tendencia ascendente a lo largo de los 14 años del panel.
+
+```{r resumen-cluster, fig.height=5}
+pca_cl |>
+  ggplot(aes(x = pc1, y = pc2, color = factor(cluster_kmeans))) +
+  geom_point(size = 4, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = pais), show.legend = FALSE, size = 4) +
+  scale_color_manual(values = c("#E76F51","#2A9D8F","#264653"), name = "Clúster") +
+  labs(title = "Tres perfiles de país según su estructura de dieta",
+       subtitle = "Países proyectados en el plano de los 2 primeros componentes principales (PCA)",
+       x = "PC1", y = "PC2")
+```
+📊 **Lectura rápida:** los países se agrupan en 3 perfiles: grandes
+productores/exportadores del Cono Sur (Argentina, Brasil, Uruguay),
+un grupo intermedio (Bolivia, Chile, Ecuador) y un grupo orientado al
+consumo interno (Colombia, Paraguay, Perú, Venezuela).
+
+```{r resumen-composicion, fig.height=5}
+grupos_resumen <- c("carne","cereales_exc_cerveza","hortalizas",
+                     "frutas_excluso_vino","leche_excl_mantequilla",
+                     "pescado_y_frutos_de_mar")
+
+kpis |>
+  select(pais, all_of(grupos_resumen)) |>
+  pivot_longer(-pais, names_to = "grupo", values_to = "valor") |>
+  mutate(grupo = str_to_title(str_replace_all(grupo, "_", " "))) |>
+  ggplot(aes(x = pais, y = valor, fill = grupo)) +
+  geom_col(position = "fill") +
+  scale_fill_brewer(palette = "Set2", name = NULL) +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(title = "¿De qué está hecha la dieta en cada país?",
+       subtitle = "Composición relativa de 6 grupos clave de alimentos",
+       x = NULL, y = NULL)
+```
+📊 **Lectura rápida:** aunque todos los países comparten los mismos grupos de
+alimentos, el peso relativo de cada uno varía notablemente — por ejemplo, el
+peso de cereales frente a carne o pescado marca buena parte de la diferencia
+regional.
+
+# Calidad de los datos
+
+## Valores faltantes
+
+```{r calidad-na}
+list(KPIs = kpis, PCA_Clusters = pca_cl, Panel = panel) |>
+  map_dfr(~ tibble(na_total = sum(is.na(.x)),
+                    filas = nrow(.x),
+                    columnas = ncol(.x)),
+          .id = "dataset") |>
+  datatable(caption = "Resumen de valores faltantes por dataset")
+```
+
+## Duplicados y consistencia de claves
+
+```{r calidad-dup}
+# Duplicados exactos
+cat("Filas duplicadas - KPIs:", sum(duplicated(kpis)), "\n")
+cat("Filas duplicadas - PCA/Clusters:", sum(duplicated(pca_cl)), "\n")
+cat("Filas duplicadas - Panel:", sum(duplicated(panel)), "\n")
+
+# Consistencia: ¿el panel tiene exactamente 14 años x 10 países = 140 filas?
+panel |> count(pais) |> datatable(caption = "N° de años reportados por país")
+
+# ¿Los mismos 10 países aparecen en los tres datasets?
+setdiff(kpis$pais, panel$pais)
+setdiff(panel$pais, kpis$pais)
+```
+
+## Valores atípicos (outliers): detección, diagnóstico y tratamiento
+
+### Paso 1 — Detección ingenua (pooled, sin agrupar por país)
+
+Se identifican primero con el criterio de rango intercuartílico (IQR) sobre
+el **panel completo mezclado** (140 filas país-año juntas), que es la forma
+más común -y más ingenua- de detectar outliers.
+
+```{r calidad-outliers-pooled}
+detectar_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  sum(x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr), na.rm = TRUE)
+}
+
+n_outliers_pooled <- panel |>
+  select(where(is.numeric), -ano, -cluster) |>
+  summarise(across(everything(), detectar_outliers)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_outliers") |>
+  arrange(desc(n_outliers))
+
+n_outliers_pooled |>
+  datatable(caption = "N° de outliers por variable - detección pooled (ingenua)")
+```
+
+### Paso 2 — Diagnóstico: ¿son errores o son estructura real del país?
+
+Antes de "tratar" nada hay que preguntarse **a qué país pertenecen** esos
+outliers. Si un mismo país concentra casi todos sus años como outlier en una
+variable, no es un dato mal medido: es que ese país **estructuralmente**
+tiene un nivel distinto (p. ej. Argentina y Brasil son economías mucho más
+grandes, por lo que su producción/exportación va a ser siempre "atípica"
+frente al resto).
+
+```{r calidad-outliers-diagnostico}
+diagnostico_outlier <- function(df, col) {
+  q1 <- quantile(df[[col]], 0.25, na.rm = TRUE)
+  q3 <- quantile(df[[col]], 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lo <- q1 - 1.5 * iqr; hi <- q3 + 1.5 * iqr
+  df |>
+    filter(.data[[col]] < lo | .data[[col]] > hi) |>
+    count(pais, name = "n_anios_atipicos") |>
+    mutate(variable = col)
+}
+
+vars_revisar <- c("produccion_total", "exportaciones_total",
+                   "food_diversity_index", "almidon_de_raices")
+
+map_dfr(vars_revisar, ~ diagnostico_outlier(panel, .x)) |>
+  datatable(caption = "¿Qué países concentran los outliers pooled? (estructura vs. error)")
+```
+
+Si `n_anios_atipicos` es igual (o casi igual) al número total de años del
+país (14), **es escala, no error** → no se elimina. Si un país aparece con
+**1-2 años atípicos** dentro de su propia serie, ahí sí puede ser una
+anomalía real de comportamiento.
+
+### Paso 3 — Detección correcta: agrupada por país (within-country)
+
+La forma correcta de detectar anomalías de *comportamiento* (no de escala)
+es aplicar el IQR **dentro de la serie temporal de cada país por separado**,
+comparando cada país solo contra sí mismo.
+
+```{r calidad-outliers-grouped}
+outliers_within <- function(df, col) {
+  df |>
+    group_by(pais) |>
+    mutate(q1 = quantile(.data[[col]], 0.25),
+           q3 = quantile(.data[[col]], 0.75),
+           iqr = q3 - q1,
+           es_outlier = .data[[col]] < (q1 - 1.5*iqr) | .data[[col]] > (q3 + 1.5*iqr)) |>
+    ungroup() |>
+    filter(es_outlier) |>
+    select(pais, ano, all_of(col))
+}
+
+outliers_within(panel, "exportaciones_total") |>
+  datatable(caption = "Anomalías reales de Exportaciones_total (dentro de la serie de cada país)")
+```
+
+> **Hallazgo:** con detección pooled, `exportaciones_total` mostraba 28
+> "outliers" (prácticamente todos los años de Argentina y Brasil). Con
+> detección *within-country*, quedan solo un puñado de años realmente
+> anómalos dentro de la trayectoria propia de cada país — entre ellos, el
+> **colapso de las exportaciones de Venezuela en 2021-2023**, que sí es una
+> anomalía de comportamiento genuina (posiblemente ligada a la crisis
+> económica del país) y merece discutirse en el análisis, no descartarse.
+
+### Paso 4 — Tratamiento aplicado
+
+No se eliminan ni imputan filas: no hay evidencia de error de captura, y
+borrar los años "grandes" de Argentina/Brasil sesgaría el estudio quitando
+justo la variabilidad entre países que la pregunta de investigación busca
+explicar. En su lugar se aplican tres tratamientos, cada uno para un
+propósito distinto:
+
+```{r calidad-outliers-tratamiento}
+# 1) Transformación logarítmica para variables de volumen muy asimétricas,
+#    a usar en correlación/PCA/regresión (reduce la influencia de la escala
+#    sin descartar datos)
+panel_log <- panel |>
+  mutate(across(c(produccion_total, importaciones_total, exportaciones_total,
+                   suministro_interno_total),
+                ~ log1p(.x), .names = "log_{.col}"))
+
+# 2) Uso de ratios ya normalizados por tamaño de país en vez de totales
+#    crudos para comparaciones cruzadas (ya vienen en el dataset)
+comparacion_cruzada <- panel |>
+  select(pais, ano, ratio_autosuficiencia, ratio_dependencia_importaciones,
+         ratio_orientacion_exportadora)
+
+# 3) Estadística robusta (mediana / MAD) para resúmenes descriptivos que no
+#    se distorsionen por los países más grandes
+panel |>
+  group_by(pais) |>
+  summarise(mediana_produccion = median(produccion_total),
+            mad_produccion = mad(produccion_total)) |>
+  arrange(desc(mediana_produccion)) |>
+  datatable(caption = "Resumen robusto de producción total por país (mediana/MAD)")
+```
+
+```{r calidad-outliers-plot}
+panel_log |>
+  select(pais, log_produccion_total, log_importaciones_total, log_exportaciones_total) |>
+  pivot_longer(-pais, names_to = "variable", values_to = "valor") |>
+  ggplot(aes(x = variable, y = valor)) +
+  geom_boxplot(fill = "#2c7fb8", alpha = 0.6, outlier.color = "red") +
+  labs(title = "Variables de comercio exterior tras transformación log(1+x)",
+       subtitle = "Comparar con la versión sin transformar: la escala entre países se comprime",
+       x = NULL, y = "log(1 + valor)") +
+  coord_flip()
+```
+
+**Resumen del tratamiento (documentar así en el informe):**
+
+| Tipo de outlier detectado | Ejemplo | Tratamiento |
+|---|---|---|
+| Escala/estructura entre países | Producción y exportación de Argentina/Brasil | No se elimina. Se usa `log1p()` para modelado y ratios normalizados para comparación cruzada |
+| Comportamiento real dentro de un país | Caída de exportaciones de Venezuela 2021-2023 | Se conserva y se documenta como hallazgo, no como error |
+| Sin evidencia de error de captura | — | No se imputa ni se borra ninguna fila del dataset |
+
+# Análisis de distribución
+
+## Resumen estadístico general
+
+```{r dist-skim}
+kpis |> select(-pais) |> skim()
+```
+
+## Forma de la distribución (asimetría y curtosis)
+
+```{r dist-forma}
+kpis |>
+  select(where(is.numeric)) |>
+  summarise(across(everything(),
+                    list(media = ~mean(.x), sd = ~sd(.x),
+                         asimetria = ~skewness(.x), curtosis = ~kurtosis(.x)))) |>
+  pivot_longer(everything(), names_to = "campo", values_to = "valor") |>
+  separate(campo, into = c("variable", "medida"), sep = "_(?=[^_]+$)") |>
+  pivot_wider(names_from = medida, values_from = valor) |>
+  datatable(caption = "Medidas de forma por variable (dataset KPIs, n=10 países)") |>
+  formatRound(columns = c("media","sd","asimetria","curtosis"), digits = 2)
+```
+
+## Histogramas de variables clave
+
+```{r dist-hist}
+vars_clave <- c("food_diversity_index", "kcal_persona_dia_total",
+                 "proteina_g_persona_dia_total", "indice_calidad_oferta_parcial")
+
+kpis |>
+  select(pais, all_of(vars_clave)) |>
+  pivot_longer(-pais, names_to = "variable", values_to = "valor") |>
+  ggplot(aes(x = valor)) +
+  geom_histogram(bins = 6, fill = "#31a354", color = "white") +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Distribución de indicadores clave entre los 10 países",
+       x = NULL, y = "Frecuencia")
+```
+
+## Test de normalidad (Shapiro-Wilk)
+
+```{r dist-shapiro}
+kpis |>
+  select(where(is.numeric)) |>
+  summarise(across(everything(), ~ shapiro.test(.x)$p.value)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "p_value") |>
+  mutate(normal_al_5pct = p_value > 0.05) |>
+  arrange(p_value) |>
+  datatable(caption = "p-valor del test de Shapiro-Wilk por variable")
+```
+
+# Análisis de diversidad alimentaria
+
+El `food_diversity_index` resume cuán repartida está la oferta calórica entre
+los distintos grupos de alimentos (mayor valor = dieta más diversificada).
+
+## Ranking entre países
+
+```{r diversidad-ranking}
+kpis |>
+  arrange(desc(food_diversity_index)) |>
+  ggplot(aes(x = fct_reorder(pais, food_diversity_index), y = food_diversity_index)) +
+  geom_col(fill = "#f03b20") +
+  coord_flip() +
+  labs(title = "Índice de diversidad alimentaria por país",
+       x = NULL, y = "Food Diversity Index")
+```
+
+## Evolución temporal de la diversidad (panel 2010-2023)
+
+```{r diversidad-tiempo}
+panel |>
+  ggplot(aes(x = ano, y = food_diversity_index, color = pais)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Evolución del índice de diversidad alimentaria (2010-2023)",
+       x = "Año", y = "Food Diversity Index", color = "País")
+```
+
+## Composición de la oferta por grupo de alimentos
+
+```{r diversidad-composicion}
+grupos <- c("aceites_vegetales","almidon_de_raices","carne","cereales_exc_cerveza",
+            "cultivos_azucareros","frutas_excluso_vino","grasas_animales","hortalizas",
+            "huevos","leche_excl_mantequilla","legumbres_secas","nueces",
+            "pescado_y_frutos_de_mar")
+
+kpis |>
+  select(pais, all_of(grupos)) |>
+  pivot_longer(-pais, names_to = "grupo", values_to = "valor") |>
+  group_by(pais) |>
+  mutate(pct = valor / sum(valor) * 100) |>
+  ggplot(aes(x = pais, y = pct, fill = grupo)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Composición relativa de la oferta alimentaria por país",
+       x = NULL, y = "% de la oferta total", fill = "Grupo de alimento") +
+  theme(legend.position = "bottom")
+```
+
+# Correlación entre variables
+
+```{r correlacion}
+kpis_num <- kpis |> select(where(is.numeric))
+mat_cor <- cor(kpis_num, use = "pairwise.complete.obs")
+
+corrplot(mat_cor, method = "color", type = "upper", order = "hclust",
+         tl.col = "black", tl.cex = 0.7, addCoef.col = "grey30",
+         number.cex = 0.5,
+         title = "Matriz de correlación - KPIs por país", mar = c(0,0,2,0))
+```
+
+# Reducción de dimensionalidad (PCA)
+
+El dataset `paises_pca_clusters` ya trae calculados `pc1` y `pc2`. Aquí se
+recalcula el PCA sobre las variables estandarizadas para **verificar e
+interpretar** los componentes (varianza explicada, cargas de las variables).
+
+```{r pca-recalculo}
+pca_vars <- kpis |> select(where(is.numeric)) |> select(-food_diversity_index)
+pca_scaled <- scale(pca_vars)
+pca_res <- prcomp(pca_scaled, center = FALSE, scale. = FALSE)
+
+summary(pca_res)
+```
+
+```{r pca-varianza}
+fviz_eig(pca_res, addlabels = TRUE,
+         main = "Varianza explicada por componente principal")
+```
+
+```{r pca-cargas}
+fviz_pca_var(pca_res, col.var = "contrib",
+             gradient.cols = c("#2b83ba","#ffffbf","#d7191c"),
+             repel = TRUE,
+             title = "Cargas de las variables en PC1 y PC2")
+```
+
+## Biplot con los clústeres ya asignados
+
+```{r pca-biplot}
+pca_cl |>
+  ggplot(aes(x = pc1, y = pc2, color = factor(cluster_kmeans), label = pais)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(show.legend = FALSE) +
+  labs(title = "Países en el espacio PC1-PC2, coloreados por clúster",
+       x = "PC1", y = "PC2", color = "Clúster")
+```
+
+# Segmentación (clustering)
+
+## Perfil de cada clúster
+
+```{r cluster-perfil}
+pca_cl |>
+  group_by(cluster_kmeans) |>
+  summarise(n_paises = n(),
+            paises = paste(pais, collapse = ", "),
+            diversidad_media = mean(food_diversity_index),
+            kcal_media = mean(kcal_persona_dia_total),
+            calidad_media = mean(indice_calidad_oferta_parcial)) |>
+  datatable(caption = "Perfil promedio por clúster")
+```
+
+## Validación con el estadístico de silueta (silhouette)
+
+```{r cluster-silhouette}
+d <- dist(pca_scaled)
+sil <- silhouette(pca_cl$cluster_kmeans, d)
+fviz_silhouette(sil) +
+  labs(title = "Calidad de la segmentación (silhouette)")
+```
+
+# Análisis de panel: comercio exterior y autosuficiencia (2010-2023)
+
+```{r panel-ratios}
+panel |>
+  group_by(pais) |>
+  summarise(autosuficiencia_media = mean(ratio_autosuficiencia),
+            dependencia_media = mean(ratio_dependencia_importaciones),
+            orientacion_export_media = mean(ratio_orientacion_exportadora)) |>
+  arrange(desc(autosuficiencia_media)) |>
+  datatable(caption = "Ratios comerciales promedio 2010-2023 por país") |>
+  formatRound(columns = 2:4, digits = 2)
+```
+
+```{r panel-tendencia}
+panel |>
+  ggplot(aes(x = ano, y = ratio_autosuficiencia, color = pais)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  labs(title = "Ratio de autosuficiencia alimentaria (Producción / Suministro interno)",
+       subtitle = "La línea punteada (=1) marca el punto de autosuficiencia plena",
+       x = "Año", y = "Ratio de autosuficiencia", color = "País")
+```
+
+# Pregunta de investigación obligatoria
+
+**¿Existe una relación entre la diversidad de productos disponibles para
+consumo y la estructura de energía, proteína y otros componentes de la
+dieta nacional?**
+
+
+
+## Diversidad alimentaria y calidad de la oferta
+
+```{r concl-diversidad-calidad}
+kpis |>
+  select(pais, food_diversity_index, indice_calidad_oferta_parcial) |>
+  arrange(desc(food_diversity_index)) |>
+  datatable(caption = "Diversidad vs. calidad de la oferta por país")
+
+cor.test(kpis$food_diversity_index, kpis$indice_calidad_oferta_parcial)
+```
+
+Brasil (2.09) y Chile (2.00) tienen la mayor diversidad alimentaria del
+grupo, mientras que Ecuador (1.88) y Bolivia (1.92) tienen la menor. Sin
+embargo, **diversidad y calidad de la oferta no coinciden**: la correlación
+entre ambas es débil (r ≈ 0.16). Colombia, Perú y Paraguay alcanzan el
+puntaje máximo de calidad (100) con niveles de diversidad solo intermedios,
+mientras que Brasil -el más diverso- tiene una calidad de oferta relativamente
+baja (82.2) y Ecuador combina la diversidad más baja con la peor calidad
+(66.4). Esto sugiere que son **dimensiones distintas de la dieta**: una mide
+cuántos grupos de alimentos distintos componen la oferta, la otra qué tan
+"saludable" es esa combinación (balance de grasas, frutas/verduras) — un país
+puede ofrecer pocos grupos de alimentos pero bien balanceados, o muchos
+grupos con un perfil nutricional desbalanceado.
+
+## Perfil productivo/comercial de los clústeres
+
+```{r concl-clusters}
+# Se usa Cluster_KMeans (de paises_pca_clusters) como partición de referencia,
+# uniéndolo al panel por país para obtener el perfil comercial promedio.
+mapa_cluster <- pca_cl |> select(pais, cluster_kmeans)
+
+panel |>
+  left_join(mapa_cluster, by = "pais") |>
+  group_by(cluster_kmeans) |>
+  summarise(paises = paste(sort(unique(pais)), collapse = ", "),
+            produccion_media = mean(produccion_total),
+            exportaciones_media = mean(exportaciones_total),
+            ratio_autosuficiencia = mean(ratio_autosuficiencia),
+            ratio_orientacion_exportadora = mean(ratio_orientacion_exportadora)) |>
+  datatable(caption = "Perfil comercial promedio por clúster (usando Cluster_KMeans)")
+```
+
+Sí, los clústeres agrupan países con perfiles comerciales coherentes:
+
+- **Clúster 0** (Argentina, Brasil, Uruguay): mayor producción y exportación
+  promedio, autosuficiencia más alta (1.37) y la mayor orientación
+  exportadora (0.33) — el grupo de grandes productores/exportadores del
+  Cono Sur.
+- **Clúster 1** (Bolivia, Chile, Ecuador): posición intermedia en todos los
+  indicadores.
+- **Clúster 2** (Colombia, Paraguay, Perú, Venezuela): menor producción,
+  autosuficiencia casi exacta (≈1.00, es decir producen casi justo lo que
+  consumen) y la menor orientación exportadora (0.13) — perfil más orientado
+  al consumo interno.
+
+
+## Correlaciones más fuertes y redundancia para el PCA
+
+Las variables más correlacionadas en el dataset de KPIs son:
+
+| Variables | r |
+|---|---|
+| `Grasa_g_persona_dia_total` — `Pct_Energia_Grasa` | 0.90 |
+| `Pct_Energia_Grasa` — `Score_Grasa` | -0.87 |
+| `Carne` — `Proteina_g_persona_dia_total` | 0.87 |
+| `Leche - Excl Mantequilla` — `Grasa_g_persona_dia_total` | 0.84 |
+| `Score_FrutasVerduras` — `Indice_Calidad_Oferta_parcial` | 0.76 |
+
+Esta redundancia es esperable y **justifica el uso de PCA**: varios
+indicadores miden esencialmente lo mismo desde ángulos distintos (el
+porcentaje de energía que viene de grasa está mecánicamente ligado a los
+gramos de grasa per cápita; el consumo de carne está mecánicamente ligado a
+la proteína disponible). El primer componente principal (`PC1`) captura
+sobre todo este eje común de "volumen calórico-proteico-graso" de la dieta,
+mientras que componentes posteriores separan aspectos más independientes
+como la diversidad de grupos de alimentos.
+
+## Evolución de la dependencia de importaciones (2010-2023)
+
+```{r concl-dependencia}
+panel |>
+  group_by(pais) |>
+  summarise(dependencia_2010_2013 = mean(ratio_dependencia_importaciones[ano %in% 2010:2013]),
+            dependencia_2020_2023 = mean(ratio_dependencia_importaciones[ano %in% 2020:2023]),
+            cambio_pp = (dependencia_2020_2023 - dependencia_2010_2013) * 100) |>
+  arrange(desc(cambio_pp)) |>
+  datatable(caption = "Cambio en la dependencia de importaciones: inicio vs. final del período (puntos porcentuales)")
+```
+
+En promedio regional, la dependencia de importaciones **aumentó** de forma
+sostenida: de 12.3% en 2010 a 16.1% en 2023 (~+0.29 puntos porcentuales por
+año). El aumento no es uniforme: **Chile** (+15.2 pp) y **Uruguay** (+7.8 pp)
+son los que más incrementaron su dependencia externa, mientras que
+**Argentina, Brasil y Bolivia** se mantuvieron prácticamente estables. El
+caso de **Venezuela es distinto**: su dependencia de importaciones
+*disminuyó* (-6.3 pp), pero esto coincide con el colapso de sus
+exportaciones e importaciones detectado en el tratamiento de outliers — no
+refleja una mejora en autosuficiencia, sino una contracción general del
+comercio exterior del país en el período reciente.
+ercio exterior: solo
+  se dispone de volumen (toneladas), no de valor (USD), lo que limita las
+  comparaciones de "productividad económica" entre países a solo una
+  dimensión física.
+- Los datos no incluyen metadatos sobre la fuente original ni el método de
+  captura, por lo que no es posible auditar errores de medición más allá de
+  las verificaciones de consistencia (duplicados, rangos, outliers)
+  realizadas en este informe.
