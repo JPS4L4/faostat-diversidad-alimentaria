@@ -1,0 +1,10 @@
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+.Rapp.history
+# docs/ se publica (GitHub Pages)

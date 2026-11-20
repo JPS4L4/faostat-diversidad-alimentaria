@@ -1,0 +1,98 @@
+# Diversidad de la oferta alimentaria en Sudamérica (FAOSTAT, 2010-2023)
+
+Un panel de 10 países sudamericanos para preguntarse si los años en que la oferta de alimentos es más diversa son también años con más energía, grasa y calidad. Tres informes en R Markdown, un panel interactivo, datos procesados y todo el código para reproducirlos.
+
+[English version](README.en.md) · Panel e informes en línea: <https://jps4l4.github.io/faostat-diversidad-alimentaria/> · [Presentación (PDF)](docs/presentacion.pdf)
+
+## La pregunta
+
+> Dentro de cada país, ¿los años de oferta alimentaria más diversa son también años con más energía, más grasa y mejor calidad de la oferta?
+
+Importa porque "más variedad" suele leerse como "mejor dieta". Aquí se pone a prueba con datos de disponibilidad, y se mide con cuidado cuánto aguanta la respuesta.
+
+## Los datos
+
+- **Fuente:** FAOSTAT (FAO). Dominio probable: Balances Alimentarios (2010-), *Food Balances*. Falta confirmar el dominio, los elementos y las unidades.
+- **Países (10):** Argentina, Bolivia, Brasil, Chile, Colombia, Ecuador, Paraguay, Perú, Uruguay y Venezuela.
+- **Panel:** 2010-2023, 140 filas país-año (equilibrado).
+- **Indicadores por país:** ventana 2019-2023.
+- **Estado:** los datos procesados están en [`data/processed/`](data/processed/). Los **datos crudos están pendientes** de añadirse; ver [`data/raw/README.md`](data/raw/README.md).
+
+## Método
+
+**1. Descriptivo** ([informe](https://jps4l4.github.io/faostat-diversidad-alimentaria/01_descriptivo.html)). Revisión de calidad de los datos, tendencias por país, prueba de Mann-Kendall, correlaciones, PCA y conglomerados. Concluye qué etapa conviene después.
+
+**2. Diagnóstico** ([informe](https://jps4l4.github.io/faostat-diversidad-alimentaria/02_diagnostico.html)).
+- Modelos de panel de efectos fijos y aleatorios (con tendencia común), y prueba de Hausman.
+- Con solo 10 países, la inferencia usual no es fiable. Se comparan errores agrupados por país, Driscoll-Kraay y bootstrap salvaje por país con pesos de Webb, con corrección de Holm por tres resultados.
+- Robustez: efectos de año, primeras diferencias, diversidad rezagada, quitar un país a la vez, quitar los años de crisis de Venezuela.
+- Pronóstico breve de la energía: ingenuo contra Holt y ARIMA, con validación estrictamente temporal (partición fija y orígenes móviles).
+
+**3. Multivariado** ([informe](https://jps4l4.github.io/faostat-diversidad-alimentaria/03_multivariado.html)).
+- **Interdependencia:** ACP de los 13 grupos de alimentos (con KMO y Bartlett), con los datos originales y centrados por país; conglomerados de Ward sobre los componentes retenidos.
+- **Dependencia:** regresión lineal multivariada (MANCOVA) de energía, grasa y calidad a la vez, con efectos fijos de país; prueba de Pillai, variable canónica y prueba de Wald conjunta con bootstrap salvaje por país.
+
+## Resultados principales
+
+Son **asociaciones**, no efectos causales. Nota de escala: el "+1 DE" usa la desviación estándar de todo el panel (0,056); la de un país a lo largo del tiempo es ≈ 0,019 (unas 3 veces menor), así que un cambio típico dentro de un país se asocia con un efecto mucho menor (del orden de 25 kcal en un ajuste simple con tendencia).
+
+- **Dentro de cada país**, +1 DE de diversidad se asocia con **+74,2 kcal/persona/día** (+2,5 %; p bootstrap Webb = 0,012; Holm = 0,038) y **+11,4 g de grasa/día** (+12 %; Holm = 0,038; se mantiene en las 6 verificaciones de robustez).
+- **Calidad de la oferta:** no hay asociación.
+- **Es frágil.** Con efectos de año ninguna asociación sobrevive a Holm. En primeras diferencias el efecto sobre la energía desaparece (-14,5 kcal; p = 0,53), mientras que el de la grasa se mantiene.
+- **Entre países (n = 10)** ninguna asociación sobrevive a Holm.
+- **Hausman** no rechaza efectos aleatorios, con poca potencia; se conservan los efectos fijos.
+- **Patrones de oferta:** la composición es sobre todo un rasgo de cada país (mediana de 93 % de la varianza entre países). Los 6 conglomerados (silueta 0,58) son tipologías de países, no etapas. Dentro de cada país aparece un eje de expansión general de la oferta que se correlaciona 0,86 con la energía pero solo 0,51 con la diversidad.
+- **Prueba conjunta:** Pillai da p < 0,001, pero el bootstrap salvaje por país da p = 0,064 (tendencia) y 0,083 (efectos de año). Con 10 países, la evidencia conjunta es débil y la asociación se concentra en la grasa.
+- **Pronóstico:** repetir el último valor supera a Holt y ARIMA (MAE en orígenes móviles 35,7 kcal/día; MAPE 1,27 %). Para el promedio regional en 2026: ≈ 2 996 kcal/día [2 920 – 3 072].
+
+![Diversidad y energía dentro de cada país](docs/img/diversidad_vs_energia.png)
+
+![Coeficientes con intervalo de confianza por bootstrap salvaje](docs/img/coeficientes.png)
+
+| | |
+|---|---|
+| ![Tendencia de la energía por país](docs/img/tendencia_energia.png) | ![Pronóstico del promedio regional](docs/img/pronostico_energia.png) |
+
+## Estructura
+
+```
+analysis/        01_descriptivo.Rmd, 02_diagnostico.Rmd, 03_multivariado.Rmd
+data/processed/  3 CSV + README con el diccionario de variables
+data/raw/        pendiente (ver su README)
+docs/            panel interactivo (index.html), informes HTML, presentación PDF y figuras (GitHub Pages)
+scripts/         install_packages.R, render.R (informes) y figures.R (figuras)
+historial/       versiones de trabajo anteriores (no forman parte de la reproducción)
+```
+
+## Cómo reproducirlo
+
+Requiere R 4.6 (probado con 4.6.1) y [Pandoc](https://pandoc.org/) (viene con RStudio).
+
+Instálalos con `Rscript scripts/install_packages.R`. Paquetes: `tidyverse`, `janitor`, `plm`, `sandwich`, `lmtest`, `knitr`, `rmarkdown`, `DT`, `corrplot`, `factoextra`, `cluster`, `ggrepel`, `moments`, `FactoMineR`, `psych`, `car`; `ragg` es opcional.
+
+```
+Rscript scripts/render.R     # genera docs/01_descriptivo.html, 02_diagnostico.html y 03_multivariado.html
+Rscript scripts/figures.R    # regenera docs/img/*.png
+```
+
+Ejecútalos desde la raíz del repositorio. Los informes toman la fecha del día en que se renderizan.
+
+## Limitaciones
+
+- Diez países y 14 años: poca potencia, y los resultados dependen de la inferencia elegida.
+- Es disponibilidad de alimentos (balances), no consumo.
+- El índice de diversidad se calcula con la misma oferta que determina energía y grasa, así que la relación puede ser en parte mecánica.
+- El índice de calidad es parcial (frutas y hortalizas, y proporción de energía de grasa).
+- Los datos crudos aún no están en el repositorio, ni el script que los convierte en los CSV procesados.
+
+## Autores
+
+Juan Salazar y Luz Ríos. Proyecto universitario (ITM).
+
+## Datos y licencia
+
+FAO. FAOSTAT. Balances Alimentarios (2010-) / *Food Balances (2010-)*. Roma. *(dominio por confirmar)*. <https://www.fao.org/faostat/>
+
+Los datos de FAOSTAT se usan según los términos de uso de la FAO.
+
+Licencia: pendiente.

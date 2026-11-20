@@ -1,0 +1,514 @@
+---
+title: "Patrones de la oferta alimentaria y su relación conjunta con energía, grasa y calidad: modelos multivariados de interdependencia y de dependencia en Sudamérica (FAO, 2010-2023)"
+author: "Juan Salazar y Luz Ríos"
+date: "`r paste(format(Sys.Date(), '%d'), 'de', c('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')[as.integer(format(Sys.Date(), '%m'))], 'de', format(Sys.Date(), '%Y'))`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5,
+                      out.width = "90%")
+
+library(tidyverse)
+library(janitor)
+library(FactoMineR)
+library(factoextra)
+library(psych)
+library(cluster)
+library(car)
+library(ggrepel)
+library(knitr)
+
+set.seed(123)
+theme_set(theme_minimal(base_size = 12))
+
+paleta_paises <- c(Argentina = "#1B9E77", Bolivia = "#D95F02", Brasil = "#7570B3",
+                   Chile = "#E7298A", Colombia = "#66A61E", Ecuador = "#E6AB02",
+                   Paraguay = "#A6761D", Perú = "#666666", Uruguay = "#1F78B4",
+                   Venezuela = "#E31A1C")
+
+# Formateadores para el texto dinámico (inline): todo número de la prosa sale de los datos
+f2  <- function(x, d = 2) formatC(x, format = "f", digits = d)
+fm  <- function(x, d = 0) formatC(x, format = "f", digits = d, big.mark = " ")
+fp  <- function(p) ifelse(p < 0.001, "< 0.001", paste0("= ", formatC(p, format = "f", digits = 3)))
+fpt <- function(p) ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+fs  <- function(x, d = 1) sprintf(paste0("%+.", d, "f"), x)
+fuente <- "Fuente: FAOSTAT, cálculos propios"
+```
+
+```{r logo, echo=FALSE, results='asis'}
+ruta_logo <- file.path("assets", "LOGO_ITM_2020-04.png")  # opcional: el logo no se publica
+if (file.exists(ruta_logo)) {
+  cat('<div style="text-align:right;"><img src="', knitr::image_uri(ruta_logo),
+      '" style="width:150px;"></div>', sep = "")
+}
+```
+
+```{r carga}
+ruta <- file.path("data", "processed")  # relativo a la raíz del repo (ver scripts/render.R)
+panel <- read_csv(file.path(ruta, "panel_pais_anio_definitivo.csv"), show_col_types = FALSE) |>
+  clean_names() |>
+  arrange(pais, ano)
+
+grupos <- c("aceites_vegetales", "almidon_de_raices", "carne", "cereales_exc_cerveza",
+            "cultivos_azucareros", "frutas_excluso_vino", "grasas_animales", "hortalizas",
+            "huevos", "leche_excl_mantequilla", "legumbres_secas", "nueces",
+            "pescado_y_frutos_de_mar")
+etiq_grupos <- c(aceites_vegetales = "Aceites vegetales", almidon_de_raices = "Almidón de raíces",
+                 carne = "Carne", cereales_exc_cerveza = "Cereales",
+                 cultivos_azucareros = "Cultivos azucareros", frutas_excluso_vino = "Frutas",
+                 grasas_animales = "Grasas animales", hortalizas = "Hortalizas", huevos = "Huevos",
+                 leche_excl_mantequilla = "Leche", legumbres_secas = "Legumbres secas",
+                 nueces = "Nueces", pescado_y_frutos_de_mar = "Pescado y mariscos")
+
+anios  <- sort(unique(panel$ano))
+paises <- sort(unique(panel$pais))
+G      <- length(paises)
+
+# Misma definición de diversidad que el informe diagnóstico: Shannon estandarizado con la DE del panel
+panel <- panel |>
+  mutate(div_z = (food_diversity_index - mean(food_diversity_index)) / sd(food_diversity_index),
+         t_c = ano - min(ano))
+
+resultados <- c("kcal_dia_total", "grasa_g_dia_total", "indice_calidad_oferta")
+et_res     <- c("Energía", "Grasa", "Índice de calidad")
+unid       <- c("kcal/día", "g/día", "puntos")
+names(et_res) <- names(unid) <- resultados
+
+X <- panel |> select(all_of(grupos)) |> rename_with(~ etiq_grupos[.x])
+n_ceros_azuc <- sum(panel$cultivos_azucareros == 0)
+lista <- function(x) if (length(x) == 1) x else paste(paste(head(x, -1), collapse = ", "), "y", tail(x, 1))
+paises_azuc  <- lista(unique(panel$pais[panel$cultivos_azucareros > 0]))
+```
+
+# Introducción
+
+Los dos informes previos de este proyecto describieron la oferta alimentaria de `r G` países de Sudamérica entre `r min(anios)` y `r max(anios)` ([descriptivo](01_descriptivo.html)) y contrastaron, con modelos de panel, si los años de oferta más diversa son también años con más energía, grasa y calidad ([diagnóstico](02_diagnostico.html)). Ambos trabajaron **una variable a la vez**: el PCA del descriptivo usó 10 países y más variables que observaciones, y el diagnóstico estimó una regresión por resultado y luego corrigió por pruebas múltiples.
+
+Este informe añade los dos tipos de modelos multivariados clásicos (Hair et al., 2019):
+
+| | **Interdependencia** | **Dependencia** |
+|---|---|---|
+| Pregunta | ¿Cómo se organizan entre sí los 13 grupos de alimentos? ¿Hay patrones de oferta y grupos de país-año? | ¿Se asocia la diversidad con energía, grasa y calidad **consideradas a la vez**? |
+| Papel de las variables | Ninguna es dependiente; todas se analizan juntas | Tres variables dependientes y una explicativa de interés |
+| Técnica | Análisis de componentes principales (ACP) + conglomerados jerárquicos (Ward) | Regresión lineal multivariada con efectos fijos de país (MANCOVA), prueba de Pillai y bootstrap salvaje por país |
+| Unidad | `r nrow(panel)` observaciones país-año | `r nrow(panel)` observaciones país-año, `r G` países |
+
+Como en los informes anteriores, los resultados son **asociaciones**, no efectos causales.
+
+# Modelo de interdependencia: patrones de la oferta alimentaria
+
+## Datos y preparación
+
+Se usan las 13 disponibilidades por grupo de alimentos de las `r nrow(panel)` observaciones país-año. Las variables tienen escalas muy distintas, por lo que el ACP se hace sobre la **matriz de correlaciones** (variables estandarizadas). Los *cultivos azucareros* valen cero en `r n_ceros_azuc` de `r nrow(panel)` observaciones (solo `r paises_azuc` tienen valores positivos); se conservan porque son información real, pero casi toda su variación es entre países.
+
+Antes del ACP conviene saber **de dónde viene la variación**: si los grupos cambian sobre todo entre países o dentro de cada país a lo largo del tiempo.
+
+```{r descomposicion}
+desc_var <- map_dfr(grupos, function(g) {
+  v <- panel[[g]]
+  tibble(grupo = etiq_grupos[g], pct_entre = 100 * (1 - var(v - ave(v, panel$pais)) / var(v)))
+}) |> mutate(pct_dentro = 100 - pct_entre) |> arrange(desc(pct_entre))
+pct_entre_med <- median(desc_var$pct_entre)
+kable(desc_var, digits = 1, col.names = c("Grupo", "% de la varianza entre países", "% dentro de cada país"),
+      caption = "Descomposición de la varianza de cada grupo de alimentos")
+```
+
+La mediana de la proporción de varianza **entre países** es `r f2(pct_entre_med, 1)` %: la composición de la oferta es, ante todo, un rasgo permanente de cada país. Por eso se hacen dos ACP: uno con los datos originales, que describe **en qué se diferencian los países**, y otro con los datos centrados en el promedio de cada país, que describe **cómo cambia la oferta dentro de un país**. El segundo es el que se conecta con el modelo de dependencia (sección 3), que también usa solo la variación dentro de cada país.
+
+## Adecuación de los datos al análisis
+
+```{r adecuacion}
+R_tot <- cor(X)
+kmo_tot <- KMO(R_tot)
+bart_tot <- cortest.bartlett(R_tot, n = nrow(X))
+nivel_kmo <- function(k) cut(k, c(0, .5, .6, .7, .8, .9, 1),
+                             labels = c("inaceptable", "miserable", "mediocre", "aceptable", "meritorio", "maravilloso"))
+```
+
+```{r corrplot, fig.height = 6.5}
+corrplot::corrplot(R_tot, method = "color", type = "upper", order = "hclust",
+                   tl.col = "black", tl.cex = 0.8, addCoef.col = "grey20", number.cex = 0.55,
+                   title = "Correlaciones entre grupos de alimentos (140 país-año)", mar = c(0, 0, 2, 0))
+```
+
+La prueba de esfericidad de Bartlett rechaza que las variables sean incorrelacionadas (chi² = `r fm(bart_tot$chisq)`, gl = `r bart_tot$df`, p `r fp(bart_tot$p.value)`), así que sí hay estructura que resumir. Pero la medida de Kaiser-Meyer-Olkin es **`r f2(kmo_tot$MSA)`**, que en la escala de Kaiser (1974) se califica de *`r nivel_kmo(kmo_tot$MSA)`*: las correlaciones están dominadas por pares de variables más que por factores comunes. En consecuencia, el ACP se usa como **reducción de dimensiones descriptiva** (resumir 13 variables en pocos ejes) y no como un análisis factorial que pretenda descubrir constructos latentes.
+
+## ACP con los datos originales: en qué se diferencian los países
+
+```{r acp}
+acp <- PCA(X, scale.unit = TRUE, ncp = 13, graph = FALSE)
+eig <- as_tibble(acp$eig, rownames = "comp") |>
+  set_names(c("comp", "valor_propio", "pct", "pct_acum"))
+n_kaiser <- sum(eig$valor_propio > 1)
+cargas <- as_tibble(acp$var$coord[, 1:3], rownames = "grupo")
+top_carga <- function(d, n = 3, signo = 1) {
+  v <- cargas[[paste0("Dim.", d)]] * signo
+  paste(cargas$grupo[order(v, decreasing = TRUE)][1:n], collapse = ", ")
+}
+cp_pais <- tibble(pais = panel$pais, CP1 = acp$ind$coord[, 1], CP2 = acp$ind$coord[, 2]) |>
+  group_by(pais) |> summarise(CP1 = mean(CP1), CP2 = mean(CP2), .groups = "drop")
+extremo <- function(cp, n = 3, signo = 1) lista(cp_pais$pais[order(signo * cp_pais[[cp]], decreasing = TRUE)][1:n])
+```
+
+```{r acp-scree, fig.height = 4}
+fviz_eig(acp, addlabels = TRUE, ncp = 8, main = "Varianza explicada por componente") +
+  geom_hline(yintercept = 100 / 13, linetype = 2, color = "grey40")
+```
+
+El criterio de Kaiser (valor propio mayor que 1; línea punteada en el gráfico, equivalente a `r f2(100 / 13, 1)` % de la varianza) retiene **`r n_kaiser` componentes**, que explican `r f2(eig$pct_acum[n_kaiser], 1)` % de la varianza. Los dos primeros explican `r f2(eig$pct[1], 1)` % y `r f2(eig$pct[2], 1)` %. Que la varianza se reparta entre varios componentes de tamaño parecido confirma lo que anticipaba el KMO: no hay un único eje dominante.
+
+```{r acp-cargas}
+cargas |>
+  arrange(desc(abs(Dim.1))) |>
+  kable(digits = 2, col.names = c("Grupo", "CP1", "CP2", "CP3"),
+        caption = "Cargas (correlación de cada grupo con los componentes), ordenadas por |CP1|")
+```
+
+```{r acp-circulo, fig.height = 5.5}
+fviz_pca_var(acp, axes = c(1, 2), repel = TRUE, col.var = "contrib",
+             gradient.cols = c("#9ecae1", "#3182bd", "#08519c"),
+             title = "Círculo de correlaciones: CP1 y CP2")
+```
+
+- **CP1** (`r f2(eig$pct[1], 1)` %) carga positivamente en `r top_carga(1)` y negativamente en `r top_carga(1, 2, -1)`. Separa una oferta **de lácteos, aceites y grasas** (en promedio, `r extremo("CP1")` en el extremo positivo) de una con más tubérculos y nueces (`r extremo("CP1", 2, -1)`).
+- **CP2** (`r f2(eig$pct[2], 1)` %) carga positivamente en `r top_carga(2)` y negativamente en `r top_carga(2, 3, -1)`: opone una oferta **de origen vegetal** (legumbres, frutas, raíces; `r extremo("CP2")`) a una más centrada en productos animales (`r extremo("CP2", 3, -1)`).
+- **CP3** (`r f2(eig$pct[3], 1)` %) carga en `r top_carga(3)`: es un eje de **hortalizas, cereales y pescado**.
+
+### Trayectorias de los países en el plano factorial
+
+```{r acp-trayectorias, fig.height = 6.5}
+coord <- as_tibble(acp$ind$coord[, 1:2]) |> set_names(c("CP1", "CP2")) |>
+  bind_cols(panel |> select(pais, ano))
+ini_fin <- coord |> group_by(pais) |> filter(ano %in% range(ano))
+desplaz <- coord |> group_by(pais) |>
+  summarise(neto = sqrt((last(CP1) - first(CP1))^2 + (last(CP2) - first(CP2))^2),
+            recorrido = sum(sqrt(diff(CP1)^2 + diff(CP2)^2)), .groups = "drop") |>
+  mutate(rango_neto = rank(-neto), rango_rec = rank(-recorrido)) |> arrange(desc(neto))
+ven <- filter(desplaz, pais == "Venezuela")
+
+ggplot(coord, aes(CP1, CP2, color = pais)) +
+  geom_hline(yintercept = 0, color = "grey80") + geom_vline(xintercept = 0, color = "grey80") +
+  geom_path(arrow = arrow(length = unit(0.18, "cm"), type = "closed"), linewidth = 0.6) +
+  geom_point(data = filter(ini_fin, ano == min(ano)), size = 1.8, shape = 1) +
+  geom_text_repel(data = filter(ini_fin, ano == max(ano)), aes(label = pais), size = 3.3, show.legend = FALSE) +
+  scale_color_manual(values = paleta_paises, guide = "none") +
+  labs(title = paste0("Trayectoria de cada país en el plano CP1-CP2, ", min(anios), "-", max(anios)),
+       subtitle = "El círculo marca el año inicial y la flecha el final",
+       x = paste0("CP1 (", f2(eig$pct[1], 1), " %)"), y = paste0("CP2 (", f2(eig$pct[2], 1), " %)"),
+       caption = fuente)
+```
+
+Cada país ocupa una región propia del plano y se mueve poco en relación con la distancia que lo separa de los demás, lo que coincide con la descomposición de la varianza. Los mayores desplazamientos netos entre `r min(anios)` y `r max(anios)` son los de **`r lista(head(desplaz$pais, 3))`**. Venezuela es el país número `r ven$rango_rec` en recorrido total (la suma de los movimientos año a año, `r f2(ven$recorrido, 1)` unidades) frente a un desplazamiento neto de solo `r f2(ven$neto, 1)`: su oferta se movió y volvió, en línea con la caída y la recuperación descritas en los informes anteriores.
+
+## Conglomerados de país-año
+
+Los conglomerados se forman con el método de Ward sobre las coordenadas de los `r n_kaiser` componentes retenidos. Usar los componentes, y no las 13 variables, evita que los grupos de alimentos muy correlacionados pesen dos veces. El número de grupos se elige con la **silueta media** (Kaufman y Rousseeuw, 1990), prefiriendo el k más pequeño cuya silueta esté a menos de 0.02 de la máxima.
+
+```{r cluster}
+Z <- acp$ind$coord[, 1:n_kaiser]
+dz <- dist(Z)
+hc <- hclust(dz, method = "ward.D2")
+k_tab <- map_dfr(2:8, function(k) tibble(k = k, silueta = mean(silhouette(cutree(hc, k), dz)[, "sil_width"])))
+k_elegido <- min(k_tab$k[k_tab$silueta >= max(k_tab$silueta) - 0.02])
+sil_k <- k_tab$silueta[k_tab$k == k_elegido]
+cl <- cutree(hc, k_elegido)
+
+# Contraste con k-means sobre las mismas coordenadas
+ari <- function(a, b) {
+  tab <- table(a, b); n <- sum(tab); sc <- function(x) sum(choose(x, 2))
+  esp <- sc(rowSums(tab)) * sc(colSums(tab)) / choose(n, 2)
+  (sc(tab) - esp) / (0.5 * (sc(rowSums(tab)) + sc(colSums(tab))) - esp)
+}
+set.seed(123)
+km <- kmeans(Z, centers = k_elegido, nstart = 50)
+ari_km <- ari(cl, km$cluster)
+nivel_sil <- if (sil_k <= 0.25) "no hay estructura sustancial" else if (sil_k <= 0.50) "la estructura es débil" else if (sil_k <= 0.70) "la estructura es razonable" else "la estructura es fuerte"
+```
+
+```{r cluster-k, fig.height = 3.8}
+ggplot(k_tab, aes(k, silueta)) + geom_line() + geom_point(size = 2) +
+  geom_point(data = filter(k_tab, k == k_elegido), color = "#E31A1C", size = 3.5) +
+  labs(title = "Silueta media según el número de conglomerados (Ward)", x = "k", y = "Silueta media")
+```
+
+```{r cluster-dendro, fig.height = 4.5}
+fviz_dend(hc, k = k_elegido, show_labels = FALSE, rect = TRUE, rect_fill = TRUE,
+          main = paste0("Dendrograma de Ward (140 país-año, k = ", k_elegido, ")"))
+```
+
+```{r cluster-composicion}
+comp_cl <- panel |> mutate(conglomerado = cl) |> count(conglomerado, pais, name = "anios") |>
+  group_by(conglomerado) |>
+  summarise(n_pais_anio = sum(anios), paises = paste0(pais, " (", anios, ")", collapse = ", "), .groups = "drop")
+paises_partidos <- panel |> mutate(conglomerado = cl) |> group_by(pais) |>
+  summarise(n_cl = n_distinct(conglomerado), .groups = "drop") |> filter(n_cl > 1) |> pull(pais)
+
+perfil_cl <- panel |> mutate(conglomerado = cl) |>
+  group_by(conglomerado) |>
+  summarise(across(all_of(grupos), mean), kcal = mean(kcal_dia_total), grasa = mean(grasa_g_dia_total),
+            calidad = mean(indice_calidad_oferta), diversidad = mean(food_diversity_index), .groups = "drop")
+
+kable(comp_cl, col.names = c("Conglomerado", "Observaciones", "Países (años en el conglomerado)"),
+      caption = paste0("Composición de los ", k_elegido, " conglomerados"))
+```
+
+```{r cluster-perfil, fig.height = 5}
+perfil_cl |>
+  select(conglomerado, all_of(grupos)) |>
+  pivot_longer(-conglomerado, names_to = "grupo", values_to = "valor") |>
+  group_by(grupo) |> mutate(z = (valor - mean(panel[[first(grupo)]])) / sd(panel[[first(grupo)]])) |> ungroup() |>
+  mutate(grupo = etiq_grupos[grupo]) |>
+  ggplot(aes(factor(conglomerado), grupo, fill = z)) +
+  geom_tile(color = "white") + geom_text(aes(label = f2(z, 1)), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0) +
+  labs(title = "Perfil de cada conglomerado (media estandarizada de cada grupo)",
+       x = "Conglomerado", y = NULL, fill = "DE", caption = fuente)
+```
+
+```{r cluster-resultados}
+perfil_cl |> select(conglomerado, kcal, grasa, calidad, diversidad) |>
+  kable(digits = c(0, 0, 1, 1, 3), col.names = c("Conglomerado", "Energía (kcal/día)", "Grasa (g/día)", "Índice de calidad", "Diversidad (Shannon)"),
+        caption = "Energía, grasa, calidad y diversidad medias por conglomerado")
+```
+
+Con k = `r k_elegido` la silueta media es `r f2(sil_k)`; según Kaufman y Rousseeuw, `r nivel_sil`. K-means con el mismo k sobre las mismas coordenadas coincide con Ward con un índice de Rand ajustado de `r f2(ari_km)` (1 = particiones idénticas)`r if (ari_km < 0.8) ", así que la frontera entre algunos grupos depende del algoritmo" else ""`. `r if (length(paises_partidos) == 0) "**Ningún país cambia de conglomerado a lo largo del período**: los grupos son conjuntos de países, no etapas temporales." else paste0("Solo ", paste(paises_partidos, collapse = " y "), " reparte sus años entre conglomerados; los demás países permanecen en el mismo grupo todo el período, de modo que los grupos son conjuntos de países y no etapas temporales.")` Esto muestra el alcance del modelo de interdependencia con los datos originales: **identifica tipologías de oferta por país** (útiles para describir la región), pero no dice nada sobre los cambios en el tiempo. Para eso se usa el ACP dentro de cada país.
+
+## ACP dentro de cada país: cómo cambia la oferta
+
+Se resta a cada grupo de alimentos el promedio de su país, de modo que solo queda la variación de cada país respecto de sí mismo, y se repite el ACP.
+
+```{r acp-within}
+Xw <- X |> mutate(across(everything(), ~ .x - ave(.x, panel$pais)))
+kmo_w <- KMO(cor(Xw))
+bart_w <- cortest.bartlett(cor(Xw), n = nrow(Xw))
+acp_w <- PCA(Xw, scale.unit = TRUE, ncp = 13, graph = FALSE)
+eig_w <- acp_w$eig[, 2]
+n_kaiser_w <- sum(acp_w$eig[, 1] > 1)
+cargas_w <- as_tibble(acp_w$var$coord[, 1:2], rownames = "grupo")
+# El signo de un componente es arbitrario: se orienta para que CP1 dentro correlacione positivamente con la energía
+s <- sign(cor(acp_w$ind$coord[, 1], panel$kcal_dia_total - ave(panel$kcal_dia_total, panel$pais)))
+cargas_w$Dim.1 <- s * cargas_w$Dim.1
+cp1w <- s * acp_w$ind$coord[, 1]
+n_pos_w <- sum(cargas_w$Dim.1 > 0.3)
+dm <- function(v) v - ave(v, panel$pais)
+r_w <- c(diversidad = cor(cp1w, dm(panel$food_diversity_index)),
+         energia = cor(cp1w, dm(panel$kcal_dia_total)),
+         grasa = cor(cp1w, dm(panel$grasa_g_dia_total)),
+         calidad = cor(cp1w, dm(panel$indice_calidad_oferta)))
+top_w <- function(d, n = 4, signo = 1) {
+  v <- cargas_w[[paste0("Dim.", d)]] * signo
+  paste(cargas_w$grupo[order(v, decreasing = TRUE)][1:n], collapse = ", ")
+}
+```
+
+```{r acp-within-cargas}
+cargas_w |> arrange(desc(Dim.1)) |>
+  kable(digits = 2, col.names = c("Grupo", "CP1 dentro", "CP2 dentro"),
+        caption = "Cargas del ACP dentro de cada país, ordenadas por CP1")
+```
+
+Los datos centrados por país se prestan **mejor** al análisis: KMO = `r f2(kmo_w$MSA)` (*`r nivel_kmo(kmo_w$MSA)`*, frente a *`r nivel_kmo(kmo_tot$MSA)`* con los datos originales) y Bartlett p `r fp(bart_w$p.value)`. El primer componente explica `r f2(eig_w[1], 1)` % de la variación dentro de los países y `r n_pos_w` de los 13 grupos tienen cargas mayores que 0.3, todas con el mismo signo (las mayores: `r top_w(1)`). Es un **eje de expansión general de la oferta**: cuando un país dispone de más alimentos en un año, la mayoría de los grupos crecen a la vez, en particular los de origen animal y las hortalizas. El segundo componente (`r f2(eig_w[2], 1)` %) opone `r top_w(2, 3)` a `r top_w(2, 2, -1)`, una **sustitución** entre almidones y aceites.
+
+```{r acp-within-cor}
+tibble(Variable = c("Diversidad (Shannon)", "Energía", "Grasa", "Índice de calidad"), r = r_w) |>
+  kable(digits = 2, col.names = c("Variable (desviación respecto del promedio del país)", "Correlación con CP1 dentro"),
+        caption = "Relación del eje de expansión general con la diversidad y los resultados nutricionales")
+```
+
+El eje de expansión se correlaciona `r f2(r_w["energia"])` con la energía y `r f2(r_w["grasa"])` con la grasa, pero solo `r f2(r_w["diversidad"])` con la diversidad y `r f2(r_w["calidad"])` con la calidad. La lectura es que **tener más comida no equivale a tener una oferta más diversa ni de mejor calidad**. Esto anticipa el resultado del modelo de dependencia: la diversidad no es simplemente un indicador indirecto de la cantidad total de alimentos.
+
+# Modelo de dependencia: regresión multivariada de energía, grasa y calidad
+
+## Por qué un modelo multivariado
+
+El informe diagnóstico estimó tres regresiones separadas y corrigió con Holm. Pero energía, grasa y calidad no son independientes entre sí: comparten la misma oferta y sus errores están correlacionados. La **regresión lineal multivariada** (o MANCOVA, porque incluye un factor, el país, y covariables) estima las tres ecuaciones juntas y permite una única **prueba conjunta** de la hipótesis
+
+$$
+H_0:\ \beta_{\text{energía}} = \beta_{\text{grasa}} = \beta_{\text{calidad}} = 0,
+$$
+
+en el modelo
+
+$$
+\mathbf{y}_{it} = \boldsymbol{\alpha}_i + \boldsymbol{\beta}\,\text{Div}_{it} + \boldsymbol{\gamma}\,t + \boldsymbol{\varepsilon}_{it},
+\qquad \mathbf{y}_{it} = (\text{energía}, \text{grasa}, \text{calidad})_{it}',
+$$
+
+con efectos fijos de país $\boldsymbol{\alpha}_i$, tendencia común $t$ (o efectos de año en la variante bidireccional) y $\text{Div}_{it}$ estandarizada con la DE del panel, como en el informe diagnóstico. Los coeficientes de cada ecuación son los mismos que los de las regresiones separadas; lo que cambia es la **inferencia**, que ahora tiene en cuenta la correlación entre los resultados.
+
+```{r manova}
+Y <- as.matrix(panel[, resultados])
+m_tend <- lm(Y ~ div_z + factor(pais) + t_c, data = panel)
+m_anio <- lm(Y ~ div_z + factor(pais) + factor(ano), data = panel)
+
+pillai <- function(m, nm) {
+  a <- Anova(m, type = 3)
+  h <- a$SSP$div_z; e <- a$SSPE
+  lam <- Re(eigen(solve(e) %*% h)$values[1])   # un solo valor propio no nulo (1 gl de hipótesis)
+  p_y <- ncol(h); gl2 <- a$error.df - p_y + 1     # con 1 gl la F es exacta bajo normalidad
+  F_ <- lam * gl2 / p_y
+  tibble(modelo = nm, pillai = lam / (1 + lam), wilks = 1 / (1 + lam), F = F_,
+         gl1 = p_y, gl2 = gl2, p = pf(F_, p_y, gl2, lower.tail = FALSE))
+}
+tab_pillai <- bind_rows(pillai(m_tend, "Efectos fijos de país + tendencia"),
+                        pillai(m_anio, "Efectos fijos de país y de año"))
+
+r_res <- cor(residuals(m_tend))
+```
+
+```{r manova-cor}
+r_res |> `dimnames<-`(list(et_res, et_res)) |>
+  kable(digits = 2, caption = "Correlación entre los residuos de las tres ecuaciones (modelo con tendencia)")
+```
+
+Los residuos de energía y grasa tienen una correlación de `r f2(r_res[1, 2])`: un año en que la energía de un país está por encima de lo que predice el modelo suele ser también un año con más grasa. Tratar las tres ecuaciones por separado ignora esa información.
+
+## Prueba conjunta clásica (Pillai)
+
+```{r manova-tabla}
+tab_pillai |> mutate(p = fpt(p)) |>
+  kable(digits = c(0, 3, 3, 1, 0, 0, 0), col.names = c("Modelo", "Traza de Pillai", "Lambda de Wilks", "F aprox.", "gl1", "gl2", "p"),
+        caption = "Prueba multivariada de la diversidad sobre (energía, grasa, calidad)")
+```
+
+Con un solo grado de libertad para la diversidad, las pruebas de Pillai, Wilks, Hotelling y Roy son equivalentes. La traza de Pillai es `r f2(tab_pillai$pillai[1], 3)` en el modelo con tendencia y `r f2(tab_pillai$pillai[2], 3)` con efectos de año, y en ambos casos la prueba F da p `r fp(max(tab_pillai$p))`. **Pero esta prueba supone que las `r nrow(panel)` observaciones son independientes**, y no lo son: son `r G` países observados `r length(anios)` años, con alta persistencia de un año al siguiente (informe descriptivo). Su valor p es, por tanto, demasiado optimista.
+
+## Combinación de resultados más asociada con la diversidad
+
+La prueba multivariada busca la combinación lineal de energía, grasa y calidad que más se asocia con la diversidad (la *variable canónica*). Sus coeficientes estandarizados y sus correlaciones con cada resultado indican qué resultados impulsan la asociación conjunta.
+
+```{r canonica}
+a <- Anova(m_tend, type = 3)
+ev <- eigen(solve(a$SSPE) %*% a$SSP$div_z)
+v <- Re(ev$vectors[, 1])
+E_res <- residuals(m_tend)
+# Resultados libres de país y tendencia (teorema de Frisch-Waugh-Lovell)
+Zc <- model.matrix(~ factor(pais) + t_c, panel)
+Yt <- apply(Y, 2, function(y) lm.fit(Zc, y)$residuals)
+xt <- lm.fit(Zc, panel$div_z)$residuals
+var_can <- drop(Yt %*% v)
+if (cor(var_can, xt) < 0) { v <- -v; var_can <- -var_can }
+can <- tibble(resultado = et_res, coef_std = v * apply(E_res, 2, sd),
+              estructura = drop(cor(Yt, var_can))) |>
+  mutate(coef_std = coef_std / max(abs(coef_std)))
+r_can <- cor(var_can, xt)
+kable(can, digits = 2, col.names = c("Resultado", "Coeficiente estandarizado (relativo al mayor)", "Correlación de estructura"),
+      caption = "Variable canónica de la diversidad (modelo con tendencia)")
+```
+
+La variable canónica se correlaciona `r f2(r_can)` con la diversidad (dentro de cada país, sin tendencia). Su correlación de estructura es `r f2(can$estructura[2])` con la **grasa**, `r f2(can$estructura[1])` con la energía y `r f2(can$estructura[3])` con la calidad: la asociación conjunta es, sobre todo, una asociación con la **grasa disponible**. El coeficiente estandarizado de la energía es `r f2(can$coef_std[1])` aunque su correlación de estructura sea positiva; es un efecto de supresión típico cuando dos variables dependientes están muy correladas (energía y grasa, `r f2(r_res[1, 2])` en los residuos): una vez considerada la grasa, la energía restante aporta en sentido contrario. Por eso se interpretan las correlaciones de estructura y no los coeficientes.
+
+## Coeficientes por ecuación
+
+```{r coefs}
+coefs <- map_dfr(list(tendencia = m_tend, anio = m_anio), function(m) {
+  b <- coef(m)["div_z", ]
+  tibble(resultado = et_res, coef = b, pct_media = 100 * b / colMeans(Y))
+}, .id = "modelo") |>
+  mutate(modelo = dplyr::recode(modelo, tendencia = "Efectos fijos de país + tendencia", anio = "Efectos fijos de país y de año"))
+kable(coefs, digits = 2, col.names = c("Modelo", "Resultado", "Coef. por +1 DE de diversidad", "% de la media"),
+      caption = "Coeficientes de la diversidad en cada ecuación (idénticos a los del informe diagnóstico)")
+cf <- function(mod, i) coefs$coef[coefs$modelo == mod][i]
+```
+
+Dentro de cada país, +1 DE de diversidad se asocia con `r fs(cf("Efectos fijos de país + tendencia", 1))` kcal/día, `r fs(cf("Efectos fijos de país + tendencia", 2))` g/día de grasa y `r fs(cf("Efectos fijos de país + tendencia", 3))` puntos del índice de calidad, los mismos valores que en el informe diagnóstico.
+
+## Inferencia con pocos países: bootstrap salvaje por país
+
+Para que la prueba conjunta respete que la información independiente está en los `r G` países, se usa una **prueba de Wald conjunta con covarianza agrupada por país** y su distribución se aproxima con un **bootstrap salvaje por país** con pesos de Webb (6 puntos), el método que el informe diagnóstico usó ecuación por ecuación (Cameron, Gelbach y Miller, 2008; Webb, 2014). El bootstrap impone la hipótesis nula (los tres coeficientes iguales a cero) y multiplica todos los residuos de un mismo país, en las tres ecuaciones a la vez, por el mismo peso aleatorio. Así conserva tanto la correlación entre años de un país como la correlación entre resultados.
+
+```{r bootstrap}
+webb <- c(-sqrt(1.5), -1, -sqrt(0.5), sqrt(0.5), 1, sqrt(1.5))
+B <- 9999
+wald_conjunto <- function(control) {
+  Zc <- model.matrix(as.formula(paste("~ factor(pais) +", control)), panel)
+  res <- function(y) lm.fit(Zc, y)$residuals
+  x <- res(panel$div_z); Yt <- apply(Y, 2, res)
+  g <- match(panel$pais, paises)
+  wald <- function(Ym) {
+    b <- colSums(x * Ym) / sum(x^2)
+    S <- rowsum(x * (Ym - outer(x, b)), g)                     # puntajes por país (G x 3)
+    V <- crossprod(S) / sum(x^2)^2 * G / (G - 1)               # covarianza agrupada por país
+    drop(t(b) %*% solve(V, b))
+  }
+  W <- wald(Yt)
+  set.seed(123)
+  W_boot <- replicate(B, wald(Yt * sample(webb, G, replace = TRUE)[g]))   # bajo H0: y* = residuo restringido x peso
+  tibble(W = W, p_chi2 = pchisq(W, df = 3, lower.tail = FALSE), p_boot = mean(W_boot >= W))
+}
+tab_boot <- bind_rows(wald_conjunto("t_c") |> mutate(modelo = "Efectos fijos de país + tendencia"),
+                      wald_conjunto("factor(ano)") |> mutate(modelo = "Efectos fijos de país y de año")) |>
+  left_join(tab_pillai |> select(modelo, p_pillai = p), by = "modelo") |>
+  relocate(modelo)
+```
+
+```{r bootstrap-tabla}
+tab_boot |> mutate(across(starts_with("p_"), fpt)) |>
+  kable(digits = 2, col.names = c("Modelo", "Wald conjunto (agrupado)", "p (chi² con 3 gl)", "p (bootstrap salvaje, Webb)", "p (Pillai, independencia)"),
+        caption = paste0("Prueba conjunta de la diversidad sobre los tres resultados, según la inferencia (", fm(B), " réplicas)"))
+```
+
+```{r bootstrap-txt, include=FALSE}
+sig_boot <- tab_boot$p_boot < 0.05
+txt_boot <- if (all(!sig_boot)) "ninguno de los dos modelos rechaza la hipótesis nula al 5 %" else if (all(sig_boot)) "ambos modelos rechazan la hipótesis nula al 5 %" else paste0("solo el modelo «", tab_boot$modelo[sig_boot], "» rechaza la hipótesis nula al 5 %")
+```
+
+El contraste entre columnas es la lección principal de este informe. Con la prueba de Pillai, que trata las `r nrow(panel)` filas como independientes, la asociación conjunta parece abrumadora (p `r fp(max(tab_boot$p_pillai))` en ambos modelos). La prueba de Wald agrupada comparada con una chi², que supone muchos grupos, también lo sugiere. Con el bootstrap salvaje por país, que es el adecuado para `r G` grupos, los valores p son `r f2(tab_boot$p_boot[1], 3)` (tendencia) y `r f2(tab_boot$p_boot[2], 3)` (efectos de año): `r txt_boot`. La evidencia de que la diversidad se asocia **conjuntamente** con energía, grasa y calidad es, en el mejor de los casos, **débil**. Es coherente con el informe diagnóstico, donde la asociación con la grasa era la más estable y la de la calidad no aparecía.
+
+## Diagnóstico de los residuos
+
+```{r residuos, fig.height = 4.5}
+S_inv <- solve(cov(E_res))
+d2 <- rowSums((E_res %*% S_inv) * E_res)
+n_ext <- sum(d2 > qchisq(0.99, 3))
+ext <- panel |> mutate(d2 = d2) |> filter(d2 > qchisq(0.99, 3)) |> arrange(desc(d2))
+tibble(teorico = qchisq(ppoints(length(d2)), df = 3), observado = sort(d2)) |>
+  ggplot(aes(teorico, observado)) +
+  geom_abline(linetype = 2, color = "grey50") + geom_point(alpha = 0.7, color = "#3182bd") +
+  labs(title = "Distancias de Mahalanobis de los residuos frente a chi² con 3 gl",
+       subtitle = "Si los residuos fueran normales multivariados, los puntos seguirían la diagonal",
+       x = "Cuantil teórico", y = "Distancia observada", caption = fuente)
+```
+
+`r n_ext` observaciones superan el percentil 99 de la chi² con 3 gl`r if (n_ext > 0) paste0(" (", paste0(ext$pais, " ", ext$ano, collapse = ", "), ")") else ""`. La cola derecha más pesada que la teórica es otra razón para no confiar en la prueba F de Pillai, que supone normalidad multivariada, y para preferir el bootstrap, que no la necesita.
+
+# Conclusiones
+
+1. **Interdependencia entre países.** La composición de la oferta es sobre todo un rasgo permanente de cada país (mediana de `r f2(pct_entre_med, 0)` % de la varianza entre países). Con los datos originales el KMO es `r f2(kmo_tot$MSA)` (*`r nivel_kmo(kmo_tot$MSA)`*), así que el ACP sirve solo para describir. Los dos primeros ejes separan una oferta ganadera y de aceites de una con más tubérculos, y una oferta vegetal de una animal. Los `r k_elegido` conglomerados (silueta `r f2(sil_k)`) son **tipologías de países**, no etapas temporales.
+2. **Interdependencia dentro de cada país.** Centrar por país mejora la adecuación (KMO `r f2(kmo_w$MSA)`) y muestra un **eje de expansión general** (`r f2(eig_w[1], 1)` %) en el que la mayoría de los grupos crecen a la vez. Ese eje se correlaciona `r f2(r_w["energia"])` con la energía pero solo `r f2(r_w["diversidad"])` con la diversidad: más cantidad no es más variedad.
+3. **Dependencia.** La regresión multivariada estima los mismos coeficientes que el informe diagnóstico, pero los prueba conjuntamente. La combinación de resultados más asociada con la diversidad está dominada por la **grasa** (correlación de estructura `r f2(can$estructura[2])`), no por la calidad.
+4. **Inferencia.** La prueba de Pillai (p `r fp(max(tab_boot$p_pillai))`) y el bootstrap salvaje por país (p = `r f2(tab_boot$p_boot[1], 3)` y `r f2(tab_boot$p_boot[2], 3)`) llegan a conclusiones opuestas. Con `r G` países, la inferencia correcta es la segunda: la evidencia conjunta es **débil**.
+
+# Limitaciones
+
+- **Diez países.** Toda la inferencia depende de `r G` unidades independientes; el bootstrap salvaje es la mejor opción disponible, pero con tan pocos grupos tiene poca potencia.
+- **KMO bajo con los datos originales.** El ACP de los datos originales es descriptivo; no se interpreta como un análisis factorial.
+- **Variable con ceros estructurales.** Los cultivos azucareros solo son positivos en `r paises_azuc`; casi toda su variación es entre países.
+- **Datos composicionales.** Las disponibilidades por grupo se analizan en gramos y no como proporciones; un análisis con transformación log-cociente (Aitchison) exigiría tratar los ceros.
+- **Relación en parte mecánica.** La diversidad, la energía y la grasa se calculan con la misma oferta.
+- **Disponibilidad, no consumo**, y asociaciones, no efectos causales (ver informes anteriores).
+
+# Referencias
+
+- FAO. *FAOSTAT: base de datos estadísticos de la FAO*. https://www.fao.org/faostat
+- Cameron, A. C., Gelbach, J. B. y Miller, D. L. (2008). Bootstrap-based improvements for inference with clustered errors. *Review of Economics and Statistics*, 90(3), 414-427.
+- Hair, J. F., Black, W. C., Babin, B. J. y Anderson, R. E. (2019). *Multivariate Data Analysis* (8.ª ed.). Cengage.
+- Johnson, R. A. y Wichern, D. W. (2007). *Applied Multivariate Statistical Analysis* (6.ª ed.). Pearson.
+- Kaiser, H. F. (1974). An index of factorial simplicity. *Psychometrika*, 39(1), 31-36.
+- Kaufman, L. y Rousseeuw, P. J. (1990). *Finding Groups in Data: An Introduction to Cluster Analysis*. Wiley.
+- Webb, M. D. (2014). *Reworking wild bootstrap based inference for clustered errors*. Queen's Economics Department Working Paper 1315.
+
+# Anexo: información de sesión
+
+```{r sesion}
+sessionInfo()
+```
